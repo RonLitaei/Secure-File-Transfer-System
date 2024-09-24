@@ -8,6 +8,7 @@
 #include <utility>
 #include <fstream>
 
+const uint8_t VERSION = 1;
 // Request Codes
 enum class RequestCodes : uint16_t {
     REGISTRATION = 825,
@@ -32,10 +33,10 @@ enum class ResponseCodes : uint16_t {
 };
 
 std::string TRANSFER_INFO_FILE_NAME = "transfer.info";
-std::string USER_DATA_FILE_NAME = "me.info";
+std::string USER_DATA_FILE_NAME = "transfer.info";
 
 class SignUp {
-    static constexpr const char* TRANSFER_FILE = "info.transfer";
+    static constexpr const char* TRANSFER_FILE = R"(C:\Users\Ron\Desktop\Defensive Programming\mmn15\Client 2.0\transfer.info)";
     static constexpr const char* ME_FILE = "info.me";
 
     static const size_t NAME_SIZE = 100;// or 255???
@@ -62,7 +63,7 @@ public:
     }
 
     // Check if me.info exists
-    static bool me_info_exists() {
+    bool me_info_exists() {
         std::ifstream me_file(ME_FILE);
         return me_file.good();
     }
@@ -71,7 +72,7 @@ public:
     void read_transfer_file() {
         std::ifstream transferFile(TRANSFER_FILE);
         if (!transferFile.is_open()) {
-            throw std::runtime_error("Could not open info.transfer for reading");
+            throw std::runtime_error("Could not open transfer.info for reading");
         }
         std::string line;
         std::getline(transferFile, line);
@@ -79,15 +80,15 @@ public:
             bool portRead = false;
             std::string tempHost;
             std::string tempPort;
-            for(int i = 0; line[i] != '\n'; i++) {
-                if((isdigit(line[i]) || line[i] == '.') && !portRead)
-                    tempHost += line[i];
-                if(line[i] == ':') {
+            for(char i : line) {
+                if((isdigit(i) || i == '.') && !portRead)
+                    tempHost += i;
+                if(i == ':') {
                     portRead = true;
                     continue;
                 }
-                if(isdigit(line[i]) && portRead) {
-                    tempPort += line[i];
+                if(isdigit(i) && portRead) {
+                    tempPort += i;
                 }
             }
             //TODO - add some sort of check to this crap name
@@ -108,6 +109,22 @@ public:
 
     std::string getName () {
         return name;
+    }
+
+    std::string getHost() {
+        return host;
+    }
+
+    std::string getPort() {
+        return port;
+    }
+
+    std::string getFilePath() {
+        return file_path;
+    }
+
+    std::string getUniqueId() {
+        return unique_id;
     }
     // Method to read from me.info file
     // this probably does not belong in this class
@@ -334,14 +351,37 @@ class Client {
             if (response.empty()) {
                 break;
      */
-    std::string receive() {
-        std::vector<char> buffer(_max_length);
-        size_t bytes_transferred = boost::asio::read(socket, boost::asio::buffer(buffer));
-        return std::string(buffer.data(), bytes_transferred);
-    }
+
 
 public:
     Client() : socket(io_context), resolver(io_context) {}
+
+    Response receive() {
+        boost::asio::streambuf buffer;
+        boost::system::error_code error;
+
+        // Read data until we hit a newline or the end of the stream
+        size_t bytes_transferred = boost::asio::read_until(socket, buffer, '\n', error);
+
+        if (error == boost::asio::error::eof) {
+            std::cout << "Connection closed by peer." << std::endl;
+            return {};
+        } else if (error) {
+            throw boost::system::system_error(error);
+        }
+
+        // Convert the streambuf into a string
+        std::string response_data{buffers_begin(buffer.data()), buffers_end(buffer.data())};
+
+        // Clear the buffer to prepare for the next read
+        buffer.consume(bytes_transferred);
+
+        // Deserialize the response data into a Response object
+        Response response = Handler::deserialize_response(response_data);
+
+        return response; // Return the Response object or handle it as needed
+    }
+
 
     void connect(const std::string& host, const std::string& port) {
         try {
@@ -351,20 +391,30 @@ public:
             std::cerr << "Connection failed: " << e.what() << std::endl;
         }
     }
-    bool isConnected() const {
+    bool isSocketReady() const {
         return socket.is_open();
     }
 
 
     // This will handle requests that will be sent to the server, the "code" stands for one
     // of the enum requests
-    void handle_communication(RequestCodes code) {
+    void request_from_server(RequestCodes code) {
         try {
             std::string payload;
-            std::array<char, 16> client_id = {"WhoTheFuckAmI!?"};//TODO - decide who the fuck am I
+            std::array<char, 16> client_id{};//TODO - decide who the fuck am I
+            std::string port;
+            std::string host;
             switch (code) {
-                case RequestCodes::REGISTRATION:
-                    payload = "Sign-up information";  // Add actual sign-up details
+                case RequestCodes::REGISTRATION: {
+                    SignUp s;
+                    if (s.me_info_exists()){
+                        payload = "Sign-in information";
+                        break;
+                    }
+                    port = s.getPort();
+                    host = s.getHost();
+                    payload = s.getName();
+                }
                 break;
 
                 case RequestCodes::SIGN_IN:
@@ -395,9 +445,10 @@ public:
                     throw std::invalid_argument("ERROR: Invalid request code");  // More specific error handling
             }
 
-            // Create and send the request
-            Request request(client_id, 1, static_cast<uint16_t>(code), static_cast<uint32_t>(payload.size()), payload);
+            // Create the request, serialize it, connect and send
+            Request request(client_id, VERSION, static_cast<uint16_t>(code), static_cast<uint32_t>(payload.size()), payload);
             std::string serialized_request = Handler::serialize_request(request);
+            connect(host, port);
             send(serialized_request);
 
         } catch (const std::invalid_argument& e) {
@@ -409,15 +460,28 @@ public:
         }
     }
 
-
-
 };
 
 int main() {
     Client client;
-    client.connect("localhost", "1256");
-    if (client.isConnected()) {
-        client.handle_communication(RequestCodes::REGISTRATION);
-        return 0;
+
+    try {
+        client.request_from_server(RequestCodes::REGISTRATION);
+        while (true) {
+            Response response = client.receive();
+            if (!response.getStatus()) {
+                break;
+            }
+            std::cout << "Code: " << response.getCode() << std::endl;
+            std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
+            std::cout << "Payload: " << response.getPayload() << std::endl;
+
+
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
     }
+
+    return 0;
 }
+
