@@ -9,6 +9,13 @@
 #include <fstream>
 
 const uint8_t VERSION = 1;
+const uint8_t HEADER_SIZE = 7;
+//Positions in the buffer from the data that is being received
+const uint8_t VERSION_POSITION = 0;
+const uint8_t CODE_POSITION = 1;
+const uint8_t PAYLOAD_SIZE_POSITION = 3;
+const uint8_t PAYLOAD_POSITION = 7;
+
 // Request Codes
 enum class RequestCodes : uint16_t {
     REGISTRATION = 825,
@@ -314,7 +321,7 @@ public:
     }
 
     static Response deserialize_response(const std::string& response_data) {
-        std::istringstream stream(response_data);
+        std::istringstream stream(response_data, std::ios::binary);
 
         uint8_t version;
         stream.read(reinterpret_cast<char*>(&version), sizeof(version));
@@ -325,13 +332,35 @@ public:
         uint32_t payload_size;
         stream.read(reinterpret_cast<char*>(&payload_size), sizeof(payload_size));
 
-        std::string payload(payload_size, '\0');
-        stream.read(&payload[0], payload_size);
+        std::string payload;
+        payload.resize(payload_size);  // Resize string to match payload size
 
-        Response response(version,code,payload_size,payload);
+        if (payload_size > 0) {
+            stream.read(&payload[0], payload_size);  // Read the payload data
+        }
+
+        // Construct the Response object
+        Response response(version, code, payload_size, payload);
         return response;
     }
+    // Unpacks data received via the network
+    static Response deserialize_header(const std::vector<uint8_t>& data) {
+        Response response;
 
+        if (data.size() < HEADER_SIZE) { // 1 (version) + 2 (code) + 4 (payload_size) + at least 1 for payload
+            throw std::runtime_error("Header size invalid. should be "+ std::to_string(HEADER_SIZE)
+                + "bytes, received: " + std::to_string(data.size()));
+        }
+
+        // Deserialize the fields from big-endian byte order
+        response.setVersion(data[VERSION_POSITION]);
+        response.setCode((data[CODE_POSITION] << 8) | data[CODE_POSITION+1]);
+        response.setPayloadSize((data[PAYLOAD_SIZE_POSITION] << 24) | (data[PAYLOAD_SIZE_POSITION+1] << 16)
+            | (data[PAYLOAD_SIZE_POSITION+2] << 8) | data[PAYLOAD_SIZE_POSITION+3]);
+        response.setStatus(true);
+
+        return response;
+    }
 
 };
 
@@ -355,33 +384,53 @@ class Client {
 
 public:
     Client() : socket(io_context), resolver(io_context) {}
-
+    /*
+     * Reads the header, extracts version, response code and payload size from it.
+     * Using the payload size, extracts the actual payload.
+     * Returns a Response object containing all the decoded information.
+     */
     Response receive() {
-        boost::asio::streambuf buffer;
+        boost::asio::streambuf header_buffer;
         boost::system::error_code error;
+        //Reads the header only
+        boost::asio::read(socket, header_buffer.prepare(HEADER_SIZE), error);
+        if (error) {
+            throw boost::system::system_error(error);
+            // TODO - add detailed error
+        }
+        header_buffer.commit(HEADER_SIZE);
 
-        // Read data until we hit a newline or the end of the stream
-        size_t bytes_transferred = boost::asio::read_until(socket, buffer, '\n', error);
+        // Setting the vector
+        boost::asio::const_buffer header_data = header_buffer.data();
+        std::vector<uint8_t> header_vector(header_data.size());
+        std::memcpy(header_vector.data(), header_data.data(), header_data.size());
 
-        if (error == boost::asio::error::eof) {
-            std::cout << "Connection closed by peer." << std::endl;
-            return {};
-        } else if (error) {
+        Response response = Handler::deserialize_header(header_vector);
+
+        uint32_t payload_size = response.getPayloadSize();
+
+        boost::asio::streambuf payload_buffer;
+        payload_buffer.prepare(payload_size);
+
+        // Reads the payload
+        boost::asio::read(socket, payload_buffer.prepare(payload_size), error);
+        if (error) {
             throw boost::system::system_error(error);
         }
+        payload_buffer.commit(payload_size);
 
-        // Convert the streambuf into a string
-        std::string response_data{buffers_begin(buffer.data()), buffers_end(buffer.data())};
+        // Updating vector with the payload
+        boost::asio::const_buffer payload_data = payload_buffer.data();
+        std::vector<uint8_t> payload_vector(payload_data.size());
+        std::memcpy(payload_vector.data(), payload_data.data(), payload_data.size());
 
-        // Clear the buffer to prepare for the next read
-        buffer.consume(bytes_transferred);
+        // Updating the Response object with the payload
+        response.setPayload(std::string(payload_vector.begin(), payload_vector.end()));
 
-        // Deserialize the response data into a Response object
-        Response response = Handler::deserialize_response(response_data);
+        std::cout << "Response data is: " << response.getPayload() << std::endl;
 
-        return response; // Return the Response object or handle it as needed
+        return response;
     }
-
 
     void connect(const std::string& host, const std::string& port) {
         try {
