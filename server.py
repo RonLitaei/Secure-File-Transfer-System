@@ -2,6 +2,7 @@ import os
 import socket
 import threading
 import struct
+import uuid
 from enum import Enum
 
 HOST = ''
@@ -9,9 +10,10 @@ DEFAULT_PORT = 1256
 DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
-VERSION = 0
-FORMAT = "16s B H I"
-MIN_REQUEST_SIZE = 23
+VERSION = 1
+UNPACK_FORMAT = "16sBHI"
+PACK_FORMAT = "!BHI"
+REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
 
 def handle_exceptions(func):
@@ -41,6 +43,29 @@ class ResponseCodes(Enum):
     SIGN_IN_FAILED = 1606
     GENERAL_ERROR = 1607
 
+class Register:
+    data_base = []
+
+    def __init__(self, clients_name):
+        if self.check_client_name(clients_name):
+            self.clients_name = clients_name
+            self.register_successful = True
+            self.client_id = self.generate_id()
+            Register.data_base.append(clients_name)
+
+    def check_client_name(self,clients_name):
+        if clients_name in Register.data_base:
+            return False
+        return True
+
+    def generate_id(self):
+        return uuid.uuid4().bytes
+
+    def is_register_successful(self):
+        return self.register_successful
+
+    def get_client_id(self):
+        return self.client_id
 '''
 Receives requests from the server and sends the response to the server  
 '''
@@ -49,8 +74,14 @@ class ClientHandler:
     def __init__(self,request):
         self.request = Request(request)
         self.response = None
+    # If registration succeeded, returns success code and the clients id, else returns the failure code and try again message
     def handle_registration(self):
-        pass
+        r1 = Register(self.request.payload)
+        if r1.is_register_successful():
+            payload = r1.get_client_id()
+            return Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,payload.__sizeof__(),payload)
+        payload = "Register failed, Please try again."
+        return Response(VERSION,ResponseCodes.REGISTRATION_FAILED,payload.__sizeof__(),payload)
     def handle_public_key(self):
         pass
     def handle_sign_in(self):
@@ -84,7 +115,7 @@ class Response:
         self.payload = payload
 
     def pack_response(self):
-        return struct.pack(FORMAT, self.version, self.code, self.payload_size, self.payload)
+        return struct.pack(PACK_FORMAT, self.version, self.code, self.payload_size) + self.payload.encode("utf-8")
 
 '''
  +---------------+----------+-----------------------------------------------------+
@@ -114,15 +145,12 @@ class Request:
 
     @handle_exceptions
     def unpack_request(self, data):
-        header_size = struct.calcsize(FORMAT)
+        header_size = len(data[:REQUEST_HEADER_SIZE])
+        if header_size != REQUEST_HEADER_SIZE:
+            raise ValueError(f"Invalid header size: {header_size}. {REQUEST_HEADER_SIZE} bytes expected.")
 
-        if header_size < MIN_REQUEST_SIZE:
-            raise ValueError(f"Request size too small - {header_size}, minimum is {MIN_REQUEST_SIZE}")
-        if header_size > MAX_REQUEST_SIZE:
-            raise ValueError(f"Request size too large - {header_size}, maximum is {MAX_REQUEST_SIZE}")
-
-        client_id, version, code, payload_size = struct.unpack(FORMAT, data[:header_size])
-        payload = data[header_size: header_size + payload_size].decode('utf-8')
+        client_id, version, code, payload_size = struct.unpack(UNPACK_FORMAT, data[:REQUEST_HEADER_SIZE])
+        payload = data[REQUEST_HEADER_SIZE: REQUEST_HEADER_SIZE + payload_size].decode('utf-8')
 
         return {
             'client_id': client_id.decode('utf-8').strip(),
@@ -131,6 +159,47 @@ class Request:
             'payload_size': payload_size,
             'payload': payload
         }
+
+    @property
+    def client_id(self):
+        return self._client_id
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def code(self):
+        return self._code
+
+    @property
+    def payload_size(self):
+        return self._payload_size
+
+    @property
+    def payload(self):
+        return self._payload
+
+    @client_id.setter
+    def client_id(self, value):
+        self._client_id = value
+
+    @version.setter
+    def version(self, value):
+        self._version = value
+
+    @code.setter
+    def code(self, value):
+        self._code = value
+
+    @payload_size.setter
+    def payload_size(self, value):
+        self._payload_size = value
+
+    @payload.setter
+    def payload(self, value):
+        self._payload = value
+
 
 '''
 Class Server - handles client connections.
@@ -152,11 +221,33 @@ class Server:
             try:
                 while self.active:
                     '''
-                    Create a client handler object
-                    Client handler will take the request, analyze it and return the needed response code
+                    Client handler will take the request, analyze it and return the needed response object
                     '''
-                    data = conn.recv(PACKET_SIZE)
-                    conn.sendall(b"Request received and processed")
+
+
+                    #TODO - data receiving needs correcting, first receive the header, extract payload size,
+                    #TODO - then receive the the payload using the payload size
+
+                    data = conn.recv(PACKET_SIZE)# Receive data
+                    request = Request(data) # Translate data to request object
+                    handler = ClientHandler(request) # Handle that request
+
+                    request_code_to_handler = {
+                        RequestCodes.REGISTRATION: handler.handle_registration,
+                        RequestCodes.SENDING_PUBLIC_KEY: handler.handle_public_key,
+                        RequestCodes.SIGN_IN: handler.handle_sign_in,
+                        RequestCodes.SENDING_FILE: handler.handle_file_received,
+                        RequestCodes.CRC_VALID: handler.handle_crc_valid,
+                        RequestCodes.CRC_NOT_VALID: handler.handle_crc_not_valid,
+                        RequestCodes.CRC_EXCEEDED_TRIES: handler.handle_crc_exceeded_tries,
+                    }
+
+                    error_message = "GENERAL ERROR: Something went wrong"
+                    response = Response(VERSION, ResponseCodes.GENERAL_ERROR, error_message.__sizeof__(), error_message)
+                    response = request_code_to_handler.get(request.code, lambda: response)()
+
+                    conn.sendall(response.pack_response())
+
 
             except (ConnectionResetError, ConnectionAbortedError):
                 print(f"Client {addr} issued disconnect")
