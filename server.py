@@ -11,9 +11,9 @@ DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
 VERSION = 1
-UNPACK_FORMAT = "16sBHI"
+UNPACK_FORMAT = "<16sBHI"
 PACK_FORMAT = "!BHI"
-REQUEST_HEADER_SIZE = 23
+REQUEST_HEADER_SIZE = 23 
 MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
 
 def handle_exceptions(func):
@@ -69,19 +69,21 @@ class Register:
 '''
 Receives requests from the server and sends the response to the server  
 '''
-
+# Default response in the general error response
 class ClientHandler:
+    error_message = "GENERAL ERROR: Something went wrong"
     def __init__(self,request):
-        self.request = Request(request)
-        self.response = None
+        self.request = request
+        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, self.error_message.__sizeof__(),self.error_message)
     # If registration succeeded, returns success code and the clients id, else returns the failure code and try again message
     def handle_registration(self):
         r1 = Register(self.request.payload)
         if r1.is_register_successful():
             payload = r1.get_client_id()
-            return Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,payload.__sizeof__(),payload)
-        payload = "Register failed, Please try again."
-        return Response(VERSION,ResponseCodes.REGISTRATION_FAILED,payload.__sizeof__(),payload)
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,payload.__sizeof__(),payload)
+        else:
+            payload = "Register failed, Please try again."
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_FAILED,payload.__sizeof__(),payload)
     def handle_public_key(self):
         pass
     def handle_sign_in(self):
@@ -129,36 +131,46 @@ class Response:
  | Payload       | Variable | Content of the request, varies based on the request |
  +---------------+----------+-----------------------------------------------------+
 '''
+# To use this class, first you must receive data that contains only the header using unpack_header,
+# later use unpack_payload
 class Request:
     def __init__(self, data):
-        unpacked_data = self.unpack_request(data)
+        unpacked_data = self.unpack_header(data)
         self.client_id = unpacked_data['client_id']
         self.version = unpacked_data['version']
         self.code = unpacked_data['code']
         self.payload_size = unpacked_data['payload_size']
-        self.payload = unpacked_data['payload']
+        self.payload = None
 
     def __str__(self):
         return (f"Request(Client ID: {self.client_id}, Version: {self.version}, "
                 f"Code: {self.code}, Payload Size: {self.payload_size}, "
                 f"Payload: {self.payload})")
 
-    @handle_exceptions
-    def unpack_request(self, data):
+    # Unpacks header from raw data, should be REQUEST_HEADER_SIZE - 23 bytes
+    def unpack_header(self, data):
         header_size = len(data[:REQUEST_HEADER_SIZE])
         if header_size != REQUEST_HEADER_SIZE:
             raise ValueError(f"Invalid header size: {header_size}. {REQUEST_HEADER_SIZE} bytes expected.")
-
-        client_id, version, code, payload_size = struct.unpack(UNPACK_FORMAT, data[:REQUEST_HEADER_SIZE])
-        payload = data[REQUEST_HEADER_SIZE: REQUEST_HEADER_SIZE + payload_size].decode('utf-8')
+        client_id, version, code, payload_size = struct.unpack(UNPACK_FORMAT, data)
+        try:
+            code_enum = RequestCodes(code)
+        except ValueError:
+            raise ValueError(f"Invalid request code: {code}")
 
         return {
             'client_id': client_id.decode('utf-8').strip(),
             'version': version,
-            'code': code,
+            'code': code_enum,
             'payload_size': payload_size,
-            'payload': payload
         }
+
+    # Unpacks the payload using the member payload_size, make sure to pass the whole data and not chunks of it
+    def unpack_payload(self, data):
+        if len(data) != self.payload_size:
+            raise ValueError(f"Incomplete payload: expected {self.payload_size} bytes, got {len(data)} bytes.")
+        payload = data.decode('utf-8')
+        self.payload = payload
 
     @property
     def client_id(self):
@@ -224,12 +236,22 @@ class Server:
                     Client handler will take the request, analyze it and return the needed response object
                     '''
 
+                    # Receive the header first
+                    header = conn.recv(REQUEST_HEADER_SIZE)
+                    request = Request(header)  # Translate data (header at this point) to request object
 
-                    #TODO - data receiving needs correcting, first receive the header, extract payload size,
-                    #TODO - then receive the the payload using the payload size
+                    # Time to initialize the payload
+                    payload = b""
+                    bytes_received = 0
+                    while bytes_received < request.payload_size:
+                        bytes_to_read = min(PACKET_SIZE, request.payload_size - bytes_received)
+                        chunk = conn.recv(bytes_to_read)
+                        if not chunk:
+                            break
+                        payload += chunk
+                        bytes_received += len(chunk)
 
-                    data = conn.recv(PACKET_SIZE)# Receive data
-                    request = Request(data) # Translate data to request object
+                    request.unpack_payload(payload)
                     handler = ClientHandler(request) # Handle that request
 
                     request_code_to_handler = {
@@ -241,12 +263,9 @@ class Server:
                         RequestCodes.CRC_NOT_VALID: handler.handle_crc_not_valid,
                         RequestCodes.CRC_EXCEEDED_TRIES: handler.handle_crc_exceeded_tries,
                     }
-
-                    error_message = "GENERAL ERROR: Something went wrong"
-                    response = Response(VERSION, ResponseCodes.GENERAL_ERROR, error_message.__sizeof__(), error_message)
-                    response = request_code_to_handler.get(request.code, lambda: response)()
-
-                    conn.sendall(response.pack_response())
+                    
+                    request_code_to_handler.get(request.code)()
+                    conn.sendall(handler.response.pack_response())
 
 
             except (ConnectionResetError, ConnectionAbortedError):
