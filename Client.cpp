@@ -8,6 +8,9 @@
 #include <utility>
 #include <fstream>
 
+#include "Base64Wrapper.h"
+#include "RSAWrapper.h"
+
 const uint8_t VERSION = 1;
 const uint8_t HEADER_SIZE = 7;
 //Positions in the buffer from the data that is being received
@@ -41,10 +44,60 @@ enum class ResponseCodes : uint16_t {
 
 std::string TRANSFER_INFO_FILE_NAME = "transfer.info";
 std::string USER_DATA_FILE_NAME = "transfer.info";
+static constexpr const char* ME_FILE = "info.me";
 
+// Method to read from me.info file
+// this probably does not belong in this class
+void read_from_me_file(std::array<uint8_t,16> uid, std::string& name, std::string& priv_key) {
+    std::ifstream me_file(ME_FILE);
+    if (!me_file.is_open()) {
+        throw std::runtime_error("Could not open info.me for reading");
+    }
+
+    std::string uid_hex;
+    std::getline(me_file, name);
+    std::getline(me_file, uid_hex);
+    std::getline(me_file, priv_key);
+
+    // Convert hex string to uint8_t array
+    if (uid_hex.size() < 32) { // Need 32 hex chars for 16 bytes
+        throw std::runtime_error("UID hex string is too short");
+    }
+
+    for (size_t i = 0; i < uid.size(); i++) {
+        std::string byte = uid_hex.substr(i * 2, 2);
+        uid[i] = static_cast<uint8_t>(std::stoul(byte, nullptr, 16));
+    }
+
+    me_file.close();
+
+    std::cout << "Client Name: " << name << std::endl;
+    std::cout << "Unique ID: " << uid.data() << std::endl;
+    std::cout << "Private Key: " << priv_key << std::endl;
+}
+
+// Method to save name, unique ID, and private key to me.info file
+//this probably doesn't belong here too
+void save_to_me_file(const std::array<uint8_t,16> uid,const std::string& name, const std::string& priv_key)  {
+    std::ofstream me_file(ME_FILE);
+    if (!me_file.is_open()) {
+        throw std::runtime_error("Could not open info.me for writing");
+    }
+
+    me_file << name << std::endl;
+    me_file << uid.data() << std::endl;
+    me_file << priv_key << std::endl;
+    me_file.close();
+}
+
+// Check if me.info exists
+static bool me_info_exists() {
+    std::ifstream me_file(ME_FILE);
+    return me_file.good();
+}
 class SignUp {
     static constexpr const char* TRANSFER_FILE = R"(C:\Users\Ron\Desktop\Defensive Programming\mmn15\Client 2.0\transfer.info)";
-    static constexpr const char* ME_FILE = "info.me";
+
 
     static const size_t NAME_SIZE = 100;// or 255???
     std::string name;
@@ -52,27 +105,16 @@ class SignUp {
     std::string host;
     std::string port;
     std::string file_path;
-    std::string unique_id;
-    std::string private_key;
 
 public:
     // Constructor
     SignUp() {
         try {
-            if (!me_info_exists())
-                read_transfer_file();
-            else
-                read_from_me_file();
+            read_transfer_file();
         }
         catch (const std::exception& e) {
             std::cout << "ERROR: Constructor for SignUp class failed: "<< e.what() << std::endl;
         }
-    }
-
-    // Check if me.info exists
-    bool me_info_exists() {
-        std::ifstream me_file(ME_FILE);
-        return me_file.good();
     }
 
     // Method to read from transfer.info file
@@ -129,48 +171,71 @@ public:
     std::string getFilePath() {
         return file_path;
     }
+};
 
-    std::string getUniqueId() {
-        return unique_id;
-    }
-    // Method to read from me.info file
-    // this probably does not belong in this class
-    void read_from_me_file() {
-        std::ifstream me_file(ME_FILE);
-        if (!me_file.is_open()) {
-            throw std::runtime_error("Could not open info.me for reading");
-        }
+class RsaKeys {
+    std::unique_ptr<RSAPrivateWrapper> _privateKeyWrapper;
+    std::string _publicKey;
+    std::string _privateKey;
+    std::string _base64EncodedPrivateKey;
 
-        std::getline(me_file, name);
-        std::getline(me_file, unique_id);
-        std::getline(me_file, private_key);
-
-        me_file.close();
-
-        std::cout << "Client Name: " << name << std::endl;
-        std::cout << "Unique ID: " << unique_id << std::endl;
-        std::cout << "Private Key: " << private_key << std::endl;
+public:
+    // Constructor
+    RsaKeys() : _privateKeyWrapper(std::make_unique<RSAPrivateWrapper>()) {
+        _publicKey = _privateKeyWrapper->getPublicKey();
+        _privateKey = _privateKeyWrapper->getPrivateKey();
+        _base64EncodedPrivateKey = Base64Wrapper::encode(_privateKey);
     }
 
-    // Method to save name, unique ID, and private key to me.info file
-    //this probably doesn't belong here too
-    void save_to_me_file(const std::string& uid, const std::string& priv_key) const {
-        std::ofstream me_file(ME_FILE);
-        if (!me_file.is_open()) {
-            throw std::runtime_error("Could not open info.me for writing");
-        }
+    // ... other methods ...
 
-        me_file << name << std::endl;
-        me_file << uid << std::endl;
-        me_file << priv_key << std::endl;
-        me_file.close();
+    // Update this method
+    void setPrivateKeyFromBase64(const std::string& base64Key) {
+        _base64EncodedPrivateKey = base64Key;
+        _privateKey = Base64Wrapper::decode(base64Key);
+        _privateKeyWrapper = std::make_unique<RSAPrivateWrapper>(_privateKey);
+    }
+
+    // Update other methods that use _privateKeyWrapper to use -> instead of .
+    RSAPublicWrapper createEncryptor() const {
+        return RSAPublicWrapper(_publicKey);
+    }
+
+    RSAPrivateWrapper createDecryptor() const {
+        std::string decodedPrivateKey = Base64Wrapper::decode(_base64EncodedPrivateKey);
+        return RSAPrivateWrapper(decodedPrivateKey);
+    }
+
+    std::string getPublicKey() const {
+        return _publicKey;
+    }
+
+    std::string getPrivateKey() const {
+        return _privateKey;
+    }
+
+    std::string getBase64EncodedPrivateKey() const {
+        return _base64EncodedPrivateKey;
     }
 };
 
 class SendPublicKey {
-    //name
-    //public key
+    std::string client_name;
+    std::string public_key;
+public:
+    SendPublicKey(std::string  name, std::string public_key) : client_name(std::move(name)),
+    public_key(std::move(public_key)) {}
+
+    explicit SendPublicKey(std::string clients_name) : client_name(std::move(clients_name)) {}
+
+    std::string getClientName() {
+        return client_name;
+    }
+    std::string getPublicKey() {
+        return public_key;
+    }
 };
+
 class LogIn {
     //name
 };
@@ -241,23 +306,23 @@ public:
 // Request from the client to the server
 class Request final : public Message {
 private:
-    std::array<char, 16> client_id;  // 16 bytes for client_id
+    std::array<uint8_t, 16> client_id;  // 16 bytes for client_id
 
 public:
     // Default constructor
     Request() : client_id({}) {}
 
     // Parameterized constructor
-    Request(const std::array<char, 16>& client_id, const uint8_t version, const uint16_t code,
+    Request(const std::array<uint8_t, 16>& client_id, const uint8_t version, const uint16_t code,
         const uint32_t payload_size, const std::string& payload) :
         Message(version, code, payload_size, payload),
         client_id(client_id) {}
 
     // Getter for code
-    std::array<char,16> getClientID() const { return client_id; }
+    std::array<uint8_t,16> getClientID() const { return client_id; }
 
     // Setter for code
-    void setClientID(const std::array<char,16> client_id) { this->client_id = client_id; }
+    void setClientID(const std::array<uint8_t,16> client_id) { this->client_id = client_id; }
 
     // Display request details (override the base display)
     void display() const override {
@@ -298,11 +363,11 @@ public:
 class Handler {
     // Makes a request ready to be sent via the network
 public:
-    static std::string serialize_request(const Request& request) {
+    static std::string pack(const Request& request) {
         std::ostringstream oss;
 
-        std::array<char, 16> client_id = request.getClientID();
-        oss.write(client_id.data(), client_id.size());
+        std::array<uint8_t, 16> client_id = request.getClientID();
+        oss.write(reinterpret_cast<const char*>(client_id.data()), client_id.size());
 
         uint8_t version = request.getVersion();
         oss.write(reinterpret_cast<const char*>(&version), sizeof(version));
@@ -320,31 +385,8 @@ public:
         return oss.str();
     }
 
-    static Response deserialize_response(const std::string& response_data) {
-        std::istringstream stream(response_data, std::ios::binary);
-
-        uint8_t version;
-        stream.read(reinterpret_cast<char*>(&version), sizeof(version));
-
-        uint16_t code;
-        stream.read(reinterpret_cast<char*>(&code), sizeof(code));
-
-        uint32_t payload_size;
-        stream.read(reinterpret_cast<char*>(&payload_size), sizeof(payload_size));
-
-        std::string payload;
-        payload.resize(payload_size);  // Resize string to match payload size
-
-        if (payload_size > 0) {
-            stream.read(&payload[0], payload_size);  // Read the payload data
-        }
-
-        // Construct the Response object
-        Response response(version, code, payload_size, payload);
-        return response;
-    }
     // Unpacks data received via the network
-    static Response deserialize_header(const std::vector<uint8_t>& data) {
+    static Response unPackHeader(const std::vector<uint8_t>& data) {
         Response response;
 
         if (data.size() < HEADER_SIZE) { // 1 (version) + 2 (code) + 4 (payload_size) + at least 1 for payload
@@ -362,6 +404,9 @@ public:
         return response;
     }
 
+    std::string unPackPayload(const std::vector<uint8_t>& data) {
+        return std::string(data.begin(), data.end());
+    }
 };
 
 class Client {
@@ -389,6 +434,55 @@ public:
      * Using the payload size, extracts the actual payload.
      * Returns a Response object containing all the decoded information.
      */
+    bool connected = false;
+    std::array<uint8_t, 16> client_id{};//TODO - this mfker does not hold the hex values correctly - fix
+    std::string client_name;
+    std::string port;
+    std::string host;
+    std::string private_key;
+    std::string decrypted_aes_key;
+    void handle_response(const Response& response) {
+        // Not a valid response code
+        if (static_cast<uint16_t>(ResponseCodes::REGISTRATION_SUCCESS) > response.getCode() || response.getCode()
+            > static_cast<uint16_t>(ResponseCodes::GENERAL_ERROR)) {
+            throw std::invalid_argument("Response code out of range");
+        }
+        ResponseCodes code = ResponseCodes(response.getCode());
+
+        switch (code) {
+            case ResponseCodes::REGISTRATION_SUCCESS: {
+                for(size_t i =0; i < client_id.size(); i++)
+                    client_id[i] = response.getPayload()[i];
+            }
+            break;
+            case ResponseCodes::REGISTRATION_FAILED: {
+                throw std::invalid_argument("Register failed, please try again with a different user name");
+            }
+            break;
+            case ResponseCodes::PUBLIC_KEY_RECEIVED_SENDING_AES: {
+                save_to_me_file(client_id,client_name,private_key);
+                std::string encrypted_aes_key;
+                for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
+                    encrypted_aes_key += response.getPayload()[i];
+                }
+                RSAPrivateWrapper wrapper(private_key);
+                //TODO - getting key size 144 but it should be 128 - this is related to the client_id data array
+                decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
+            }
+            break;
+            case ResponseCodes::SIGN_IN_SUCCESS:{}
+            break;
+            case ResponseCodes::SIGN_IN_FAILED:{}
+            break;
+            case ResponseCodes::FILE_RECEIVED:{}
+            break;
+            case ResponseCodes::MESSAGE_RECEIVED:{}
+            break;
+            case ResponseCodes::GENERAL_ERROR:{}
+            break;
+        }
+
+    }
     Response receive() {
         boost::asio::streambuf header_buffer;
         boost::system::error_code error;
@@ -405,7 +499,7 @@ public:
         std::vector<uint8_t> header_vector(header_data.size());
         std::memcpy(header_vector.data(), header_data.data(), header_data.size());
 
-        Response response = Handler::deserialize_header(header_vector);
+        Response response = Handler::unPackHeader(header_vector);
 
         uint32_t payload_size = response.getPayloadSize();
 
@@ -439,6 +533,7 @@ public:
         } catch (const boost::system::system_error& e) {
             std::cerr << "Connection failed: " << e.what() << std::endl;
         }
+        connected = true;
     }
     bool isSocketReady() const {
         return socket.is_open();
@@ -447,47 +542,62 @@ public:
 
     // This will handle requests that will be sent to the server, the "code" stands for one
     // of the enum requests
-    void request_from_server(RequestCodes code) {
+    Request request_from_server(RequestCodes code) {
         try {
             std::string payload;
-            std::array<char, 16> client_id{};//TODO - decide who the fuck am I
-            std::string port;
-            std::string host;
             switch (code) {
                 case RequestCodes::REGISTRATION: {
                     SignUp s;
-                    if (s.me_info_exists()){
+                    if (me_info_exists()){
                         payload = "Sign-in information";
                         break;
                     }
                     port = s.getPort();
                     host = s.getHost();
+                    client_name = s.getName();
                     payload = s.getName();
+                    payload.resize(255,'\0');
                 }
                 break;
 
-                case RequestCodes::SIGN_IN:
-                    payload = "Sign-in information";  // Add actual sign-in details
+                case RequestCodes::SENDING_PUBLIC_KEY: {
+                    RsaKeys rsa = RsaKeys();
+                    private_key = rsa.getPrivateKey();
+                    std::string public_key = rsa.getPublicKey();
+                    std::string name = client_name;
+
+                    // Pad name to 255 bytes
+                    name.resize(255, '\0');
+                    // Construct payload: padded name (255 bytes) followed by public key (160 bytes)
+                    payload = name + public_key;
+                    // Ensure the public key part is exactly 160 bytes
+                    payload.resize(255 + 160, '\0');
+                }
                 break;
 
-                case RequestCodes::SENDING_PUBLIC_KEY:
-                    payload = "Public key data";  // Add actual public key data
+                case RequestCodes::SIGN_IN: {
+                    payload = "Sign-in information";
+                }// Add actual sign-in details
                 break;
 
-                case RequestCodes::SENDING_FILE:
+                case RequestCodes::SENDING_FILE: {
                     payload = "File data";  // Add actual file data
+                }
                 break;
 
-                case RequestCodes::CRC_VALID:
+                case RequestCodes::CRC_VALID: {
                     payload = "CRC validation success";  // Message for successful CRC validation
+                }
                 break;
 
-                case RequestCodes::CRC_NOT_VALID:
-                    payload = "CRC validation failed";  // Message for failed CRC validation
+                case RequestCodes::CRC_NOT_VALID: {
+                    payload = "CRC validation failed";
+                }// Message for failed CRC validation
                 break;
 
-                case RequestCodes::CRC_EXCEEDED_TRIES:
-                    payload = "Exceeded CRC retry attempts";  // Message for exceeding retry limit
+                case RequestCodes::CRC_EXCEEDED_TRIES: {
+                    payload = "Exceeded CRC retry attempts";
+                }// Message for exceeding retry limit
                 break;
 
                 default:
@@ -496,9 +606,11 @@ public:
 
             // Create the request, serialize it, connect and send
             Request request(client_id, VERSION, static_cast<uint16_t>(code), static_cast<uint32_t>(payload.size()), payload);
-            std::string serialized_request = Handler::serialize_request(request);
-            connect(host, port);
-            send(serialized_request);
+            std::string packed_request = Handler::pack(request);
+            if(!connected)
+                connect(host, port);
+            send(packed_request);
+            return request;
 
         } catch (const std::invalid_argument& e) {
             std::cerr << "Invalid argument: " << e.what() << std::endl;  // Specific handling for invalid arguments
@@ -507,29 +619,32 @@ public:
         } catch (const std::exception& e) {
             std::cerr << "Communication error: " << e.what() << std::endl;  // Generic handling for other exceptions
         }
+        return Request();
     }
-
 };
 
 int main() {
-    Client client;
-
     try {
-        client.request_from_server(RequestCodes::REGISTRATION);
-        while (true) {
-            Response response = client.receive();
-            if (!response.getStatus()) {
-                break;
-            }
-            std::cout << "Code: " << response.getCode() << std::endl;
-            std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
-            std::cout << "Payload: " << response.getPayload() << std::endl;
+        Client client;
+        Request request = client.request_from_server(RequestCodes::REGISTRATION);
+        Response response = client.receive();
+        client.handle_response(response);
+        std::cout << "Code: " << response.getCode() << std::endl;
+        std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
+        std::cout << "Payload: " << response.getPayload() << std::endl;
+        request = client.request_from_server(RequestCodes::SENDING_PUBLIC_KEY);
+        response = client.receive();
+        client.handle_response(response);
 
-
-        }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::invalid_argument& e) {
+        std::cerr << "Invalid argument: " << e.what() << std::endl;
+    }
+    catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
+
+
 
     return 0;
 }
