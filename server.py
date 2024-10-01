@@ -3,6 +3,10 @@ import socket
 import threading
 import struct
 import uuid
+from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
 from enum import Enum
 
 HOST = ''
@@ -13,7 +17,7 @@ SERVER_MAX_CONNECTIONS = 50
 VERSION = 1
 UNPACK_FORMAT = "<16sBHI"
 PACK_FORMAT = "!BHI"
-REQUEST_HEADER_SIZE = 23 
+REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
 
 def handle_exceptions(func):
@@ -44,14 +48,16 @@ class ResponseCodes(Enum):
     GENERAL_ERROR = 1607
 
 class Register:
-    data_base = []
+    data_base = {}
 
     def __init__(self, clients_name):
         if self.check_client_name(clients_name):
             self.clients_name = clients_name
             self.register_successful = True
             self.client_id = self.generate_id()
-            Register.data_base.append(clients_name)
+            Register.data_base.update({clients_name : self.client_id})
+        else:
+            self.register_successful = False
 
     def check_client_name(self,clients_name):
         if clients_name in Register.data_base:
@@ -59,7 +65,7 @@ class Register:
         return True
 
     def generate_id(self):
-        return uuid.uuid4().bytes
+        return uuid.uuid4().hex
 
     def is_register_successful(self):
         return self.register_successful
@@ -69,23 +75,46 @@ class Register:
 '''
 Receives requests from the server and sends the response to the server  
 '''
-# Default response in the general error response
+
 class ClientHandler:
-    error_message = "GENERAL ERROR: Something went wrong"
+    error_message = b"GENERAL ERROR: Something went wrong"
     def __init__(self,request):
         self.request = request
-        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, self.error_message.__sizeof__(),self.error_message)
+        # Default response in the general error response
+        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, len(self.error_message),self.error_message)
+
     # If registration succeeded, returns success code and the clients id, else returns the failure code and try again message
     def handle_registration(self):
-        r1 = Register(self.request.payload)
+        r1 = Register(self.request.payload.decode('ascii').rstrip('\0'))
         if r1.is_register_successful():
             payload = r1.get_client_id()
-            self.response = Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,payload.__sizeof__(),payload)
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,len(payload),payload)
         else:
             payload = "Register failed, Please try again."
-            self.response = Response(VERSION,ResponseCodes.REGISTRATION_FAILED,payload.__sizeof__(),payload)
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_FAILED,len(payload),payload)
     def handle_public_key(self):
-        pass
+        payload = b""
+        encoded_name = self.request.payload[:255]
+        name = encoded_name.decode('ascii').rstrip('\0')
+        client_id = Register.data_base.get(name)
+
+        if client_id is None:
+            payload = b"Client id not found"
+            #TODO - add these methods to Response
+            #self.response.set_payloadsize(len(payload))
+            #self.response.set_payload(payload)
+            return
+
+        #TODO - this can be written in a different function
+        public_key_pem = self.request.payload[255:255 + 160]
+        aes_key = get_random_bytes(32)
+        public_key = RSA.import_key(public_key_pem)
+        cipher_rsa = PKCS1_OAEP.new(public_key)
+        encrypted_aes_key = cipher_rsa.encrypt(aes_key)
+
+        payload = bytes(client_id, 'ascii')
+        payload += encrypted_aes_key
+        self.response = Response(VERSION,ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES,len(payload),payload)
     def handle_sign_in(self):
         pass
     def handle_file_received(self):
@@ -117,7 +146,9 @@ class Response:
         self.payload = payload
 
     def pack_response(self):
-        return struct.pack(PACK_FORMAT, self.version, self.code, self.payload_size) + self.payload.encode("utf-8")
+        if type(self.payload) != bytes:
+            return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload.encode("ascii")
+        return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload
 
 '''
  +---------------+----------+-----------------------------------------------------+
@@ -132,7 +163,8 @@ class Response:
  +---------------+----------+-----------------------------------------------------+
 '''
 # To use this class, first you must receive data that contains only the header using unpack_header,
-# later use unpack_payload
+# later set the payload.
+# Payload is raw bytes, decode later in what you need
 class Request:
     def __init__(self, data):
         unpacked_data = self.unpack_header(data)
@@ -159,59 +191,58 @@ class Request:
             raise ValueError(f"Invalid request code: {code}")
 
         return {
-            'client_id': client_id.decode('utf-8').strip(),
+            'client_id': client_id.decode('ascii').strip(),
             'version': version,
             'code': code_enum,
             'payload_size': payload_size,
         }
 
-    # Unpacks the payload using the member payload_size, make sure to pass the whole data and not chunks of it
-    def unpack_payload(self, data):
+    # sets the payload in bytes, make sure to pass the whole data and not chunks of it
+    def set_payload(self, data):
         if len(data) != self.payload_size:
             raise ValueError(f"Incomplete payload: expected {self.payload_size} bytes, got {len(data)} bytes.")
-        payload = data.decode('utf-8')
-        self.payload = payload
-
+        self.payload = data
+    '''
     @property
     def client_id(self):
-        return self._client_id
+        return self.client_id
 
     @property
     def version(self):
-        return self._version
+        return self.version
 
     @property
     def code(self):
-        return self._code
+        return self.code
 
     @property
     def payload_size(self):
-        return self._payload_size
+        return self.payload_size
 
     @property
     def payload(self):
-        return self._payload
+        return self.payload
 
     @client_id.setter
     def client_id(self, value):
-        self._client_id = value
+        self.client_id = value
 
     @version.setter
     def version(self, value):
-        self._version = value
+        self.version = value
 
     @code.setter
     def code(self, value):
-        self._code = value
+        self.code = value
 
     @payload_size.setter
     def payload_size(self, value):
-        self._payload_size = value
+        self.payload_size = value
 
     @payload.setter
     def payload(self, value):
-        self._payload = value
-
+        self.payload = value
+'''
 
 '''
 Class Server - handles client connections.
@@ -238,6 +269,9 @@ class Server:
 
                     # Receive the header first
                     header = conn.recv(REQUEST_HEADER_SIZE)
+                    if not header:
+                        print(f"Stopped receiving communication from client {addr}")
+                        break
                     request = Request(header)  # Translate data (header at this point) to request object
 
                     # Time to initialize the payload
@@ -251,8 +285,8 @@ class Server:
                         payload += chunk
                         bytes_received += len(chunk)
 
-                    request.unpack_payload(payload)
-                    handler = ClientHandler(request) # Handle that request
+                    request.set_payload(payload)
+                    handler = ClientHandler(request)
 
                     request_code_to_handler = {
                         RequestCodes.REGISTRATION: handler.handle_registration,
@@ -263,8 +297,9 @@ class Server:
                         RequestCodes.CRC_NOT_VALID: handler.handle_crc_not_valid,
                         RequestCodes.CRC_EXCEEDED_TRIES: handler.handle_crc_exceeded_tries,
                     }
-                    
+
                     request_code_to_handler.get(request.code)()
+                    print(request.payload)
                     conn.sendall(handler.response.pack_response())
 
 
