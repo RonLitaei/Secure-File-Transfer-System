@@ -15,7 +15,7 @@ DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
 VERSION = 1
-UNPACK_FORMAT = "<16sBHI"
+UNPACK_FORMAT = "<BHI"
 PACK_FORMAT = "!BHI"
 REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
@@ -184,14 +184,16 @@ class Request:
         header_size = len(data[:REQUEST_HEADER_SIZE])
         if header_size != REQUEST_HEADER_SIZE:
             raise ValueError(f"Invalid header size: {header_size}. {REQUEST_HEADER_SIZE} bytes expected.")
-        client_id, version, code, payload_size = struct.unpack(UNPACK_FORMAT, data)
+        client_id = data[:16]#TODO - change values to consts
+        data = data[16:]
+        version, code, payload_size = struct.unpack(UNPACK_FORMAT, data[:7])
         try:
             code_enum = RequestCodes(code)
         except ValueError:
             raise ValueError(f"Invalid request code: {code}")
 
         return {
-            'client_id': client_id.decode('ascii').strip(),
+            'client_id': client_id,
             'version': version,
             'code': code_enum,
             'payload_size': payload_size,
