@@ -7,6 +7,7 @@
 #include <boost/asio.hpp>
 #include <utility>
 #include <fstream>
+#include <iomanip>
 
 #include "Base64Wrapper.h"
 #include "RSAWrapper.h"
@@ -83,10 +84,16 @@ void save_to_me_file(const std::array<uint8_t,16> uid,const std::string& name, c
     if (!me_file.is_open()) {
         throw std::runtime_error("Could not open info.me for writing");
     }
-
+    // Convert UID to hex string
+    std::stringstream hex_uid;
+    hex_uid << std::hex << std::setfill('0');
+    for (uint8_t byte : uid) {
+        hex_uid << std::setw(2) << static_cast<int>(byte);
+    }
+    std::string priv_key_base64 = Base64Wrapper::encode(priv_key);
     me_file << name << std::endl;
-    me_file << uid.data() << std::endl;
-    me_file << priv_key << std::endl;
+    me_file << hex_uid.str() << std::endl;
+    me_file << priv_key_base64 << std::endl;
     me_file.close();
 }
 
@@ -404,7 +411,7 @@ public:
         return response;
     }
 
-    std::string unPackPayload(const std::vector<uint8_t>& data) {
+    static std::string unPackPayload(const std::vector<uint8_t>& data) {
         return std::string(data.begin(), data.end());
     }
 };
@@ -442,17 +449,15 @@ public:
     std::string private_key;
     std::string decrypted_aes_key;
     void handle_response(const Response& response) {
-        // Not a valid response code
-        if (static_cast<uint16_t>(ResponseCodes::REGISTRATION_SUCCESS) > response.getCode() || response.getCode()
-            > static_cast<uint16_t>(ResponseCodes::GENERAL_ERROR)) {
-            throw std::invalid_argument("Response code out of range");
-        }
         ResponseCodes code = ResponseCodes(response.getCode());
 
         switch (code) {
             case ResponseCodes::REGISTRATION_SUCCESS: {
-                for(size_t i =0; i < client_id.size(); i++)
-                    client_id[i] = response.getPayload()[i];
+                //TODO - how to store client id? in hex? in chars? in my ass?
+                for(size_t i =0; i < client_id.size(); i++) {
+                    std::string byte_str = response.getPayload().substr(i*2, 2);
+                    client_id[i] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                }
             }
             break;
             case ResponseCodes::REGISTRATION_FAILED: {
@@ -480,6 +485,8 @@ public:
             break;
             case ResponseCodes::GENERAL_ERROR:{}
             break;
+            default:
+                throw std::invalid_argument("ERROR: Invalid response code");
         }
 
     }
