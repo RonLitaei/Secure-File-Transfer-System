@@ -1,3 +1,4 @@
+import base64
 import os
 import socket
 import threading
@@ -19,6 +20,27 @@ UNPACK_FORMAT = "<BHI"
 PACK_FORMAT = "!BHI"
 REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
+
+
+def encrypt_aes_key(public_key_pem):
+    try:
+        # Generate a random 256-bit AES key
+        aes_key = get_random_bytes(32)
+        print(f"AES key (base64): {base64.b64encode(aes_key).decode('utf-8')}")
+
+        # Import the public key
+        public_key = RSA.import_key(public_key_pem)
+
+        # Create cipher object and encrypt the AES key
+        cipher_rsa = PKCS1_OAEP.new(public_key)
+        encrypted_aes_key = cipher_rsa.encrypt(aes_key)
+
+        print(f"Encrypted AES key (base64): {base64.b64encode(encrypted_aes_key).decode('utf-8')}")
+        return encrypted_aes_key, aes_key
+
+    except ValueError as e:
+        print(f"Error importing key or encrypting: {str(e)}")
+        return None, None
 
 def handle_exceptions(func):
     def wrapper(*args, **kwargs):
@@ -65,7 +87,8 @@ class Register:
         return True
 
     def generate_id(self):
-        return uuid.uuid4().hex
+        id = uuid.uuid4().hex
+        return bytes.fromhex(id)
 
     def is_register_successful(self):
         return self.register_successful
@@ -107,12 +130,14 @@ class ClientHandler:
 
         #TODO - this can be written in a different function
         public_key_pem = self.request.payload[255:255 + 160]
-        aes_key = get_random_bytes(32)
+        encrypted_aes_key, aes = encrypt_aes_key(public_key_pem)
+        '''aes_key = get_random_bytes(32)
+        print(f"aes key is: {aes_key}")
         public_key = RSA.import_key(public_key_pem)
         cipher_rsa = PKCS1_OAEP.new(public_key)
-        encrypted_aes_key = cipher_rsa.encrypt(aes_key)
+        encrypted_aes_key = cipher_rsa.encrypt(aes_key)'''
 
-        payload = bytes(client_id, 'ascii')
+        payload = client_id
         payload += encrypted_aes_key
         self.response = Response(VERSION,ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES,len(payload),payload)
     def handle_sign_in(self):
