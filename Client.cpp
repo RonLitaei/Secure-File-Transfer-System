@@ -47,6 +47,28 @@ std::string TRANSFER_INFO_FILE_NAME = "transfer.info";
 std::string USER_DATA_FILE_NAME = "transfer.info";
 static constexpr const char* ME_FILE = "info.me";
 
+void printAESKey(const std::string& aes_key) {
+    // 1. Print as hex
+    std::cout << "AES Key (hex): ";
+    for (unsigned char c : aes_key) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<int>(static_cast<unsigned char>(c));
+    }
+    std::cout << std::endl;
+
+    // 2. Print as Base64
+    Base64Wrapper base64;
+    std::string encoded = base64.encode(aes_key);
+    std::cout << "AES Key (Base64): " << encoded << std::endl;
+
+    // Verification: decode and compare
+    std::string decoded = base64.decode(encoded);
+    if (decoded == aes_key) {
+        std::cout << "Verification: Base64 encoding/decoding successful" << std::endl;
+    } else {
+        std::cout << "Verification: Base64 encoding/decoding mismatch!" << std::endl;
+    }
+}
 // Method to read from me.info file
 // this probably does not belong in this class
 void read_from_me_file(std::array<uint8_t,16> uid, std::string& name, std::string& priv_key) {
@@ -442,7 +464,7 @@ public:
      * Returns a Response object containing all the decoded information.
      */
     bool connected = false;
-    std::array<uint8_t, 16> client_id{};//TODO - this mfker does not hold the hex values correctly - fix
+    std::array<uint8_t, 16> client_id{};
     std::string client_name;
     std::string port;
     std::string host;
@@ -453,10 +475,8 @@ public:
 
         switch (code) {
             case ResponseCodes::REGISTRATION_SUCCESS: {
-                //TODO - how to store client id? in hex? in chars? in my ass?
                 for(size_t i =0; i < client_id.size(); i++) {
-                    std::string byte_str = response.getPayload().substr(i*2, 2);
-                    client_id[i] = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                    client_id[i] = response.getPayload()[i];
                 }
             }
             break;
@@ -465,13 +485,12 @@ public:
             }
             break;
             case ResponseCodes::PUBLIC_KEY_RECEIVED_SENDING_AES: {
-                save_to_me_file(client_id,client_name,private_key);
+                //save_to_me_file(client_id,client_name,private_key);//TODO - uncomment later
                 std::string encrypted_aes_key;
                 for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
                     encrypted_aes_key += response.getPayload()[i];
                 }
                 RSAPrivateWrapper wrapper(private_key);
-                //TODO - getting key size 144 but it should be 128 - this is related to the client_id data array
                 decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
             }
             break;
@@ -555,14 +574,21 @@ public:
             switch (code) {
                 case RequestCodes::REGISTRATION: {
                     SignUp s;
-                    if (me_info_exists()){
-                        payload = "Sign-in information";
-                        break;
+                    if (me_info_exists()){// Performing sign in
+                        std::ifstream me_info("me.info");
+                        if(!me_info.is_open()) {
+                            throw std::invalid_argument("me.info not found");
+                        }
+                        code = RequestCodes::SIGN_IN;
+                        std::getline(me_info, payload);//TODO - decide if to add a check to users name
+                        me_info.close();
                     }
-                    port = s.getPort();
-                    host = s.getHost();
-                    client_name = s.getName();
-                    payload = s.getName();
+                    else {// Performing sign up
+                        port = s.getPort();
+                        host = s.getHost();
+                        client_name = s.getName();
+                        payload = s.getName();
+                    }
                     payload.resize(255,'\0');
                 }
                 break;
@@ -573,11 +599,8 @@ public:
                     std::string public_key = rsa.getPublicKey();
                     std::string name = client_name;
 
-                    // Pad name to 255 bytes
                     name.resize(255, '\0');
-                    // Construct payload: padded name (255 bytes) followed by public key (160 bytes)
                     payload = name + public_key;
-                    // Ensure the public key part is exactly 160 bytes
                     payload.resize(255 + 160, '\0');
                 }
                 break;
@@ -642,6 +665,9 @@ int main() {
         request = client.request_from_server(RequestCodes::SENDING_PUBLIC_KEY);
         response = client.receive();
         client.handle_response(response);
+        std::cout << "Code: " << response.getCode() << std::endl;
+        std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
+        std::cout << "Payload: " << response.getPayload() << std::endl;
 
     }
     catch (const std::invalid_argument& e) {
