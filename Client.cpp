@@ -8,10 +8,13 @@
 #include <utility>
 #include <fstream>
 #include <iomanip>
+#include <filesystem>
 
 #include "Base64Wrapper.h"
 #include "RSAWrapper.h"
+#include "AESWrapper.h"
 
+class Client;
 const uint8_t VERSION = 1;
 const uint8_t HEADER_SIZE = 7;
 //Positions in the buffer from the data that is being received
@@ -69,6 +72,15 @@ void printAESKey(const std::string& aes_key) {
         std::cout << "Verification: Base64 encoding/decoding mismatch!" << std::endl;
     }
 }
+
+// Helper function to convert hex string to uint8_t
+uint8_t hex_to_byte(const std::string& hex) {
+    uint8_t byte;
+    std::stringstream ss;
+    ss << std::hex << hex;
+    ss >> byte;
+    return byte;
+}
 // Method to read from me.info file
 // this probably does not belong in this class
 void read_from_me_file(std::array<uint8_t,16> uid, std::string& name, std::string& priv_key) {
@@ -122,7 +134,9 @@ void save_to_me_file(const std::array<uint8_t,16> uid,const std::string& name, c
 // Check if me.info exists
 static bool me_info_exists() {
     std::ifstream me_file(ME_FILE);
-    return me_file.good();
+    bool status = me_file.good();
+    me_file.close();
+    return status;
 }
 class SignUp {
     static constexpr const char* TRANSFER_FILE = R"(C:\Users\Ron\Desktop\Defensive Programming\mmn15\Client 2.0\transfer.info)";
@@ -437,6 +451,7 @@ public:
         return std::string(data.begin(), data.end());
     }
 };
+void sendEncryptedFile(const std::string & string, const Client & client);
 
 class Client {
     boost::asio::io_context io_context;
@@ -444,9 +459,6 @@ class Client {
     boost::asio::ip::tcp::resolver resolver;
     int _max_length = 1024;
 
-    void send(const std::string& message) {
-        boost::asio::write(socket, boost::asio::buffer(message));
-    }
     /*
      * usage:
      * while (true) {
@@ -470,6 +482,12 @@ public:
     std::string host;
     std::string private_key;
     std::string decrypted_aes_key;
+    std::string file_to_send;
+
+    void send(const std::string& message) {
+        boost::asio::write(socket, boost::asio::buffer(message));
+    }
+
     void handle_response(const Response& response) {
         ResponseCodes code = ResponseCodes(response.getCode());
 
@@ -485,7 +503,7 @@ public:
             }
             break;
             case ResponseCodes::PUBLIC_KEY_RECEIVED_SENDING_AES: {
-                //save_to_me_file(client_id,client_name,private_key);//TODO - uncomment later
+                save_to_me_file(client_id,client_name,private_key);//TODO - uncomment later
                 std::string encrypted_aes_key;
                 for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
                     encrypted_aes_key += response.getPayload()[i];
@@ -565,7 +583,6 @@ public:
         return socket.is_open();
     }
 
-
     // This will handle requests that will be sent to the server, the "code" stands for one
     // of the enum requests
     Request request_from_server(RequestCodes code) {
@@ -575,20 +592,32 @@ public:
                 case RequestCodes::REGISTRATION: {
                     SignUp s;
                     if (me_info_exists()){// Performing sign in
-                        std::ifstream me_info("me.info");
+                        std::ifstream me_info(ME_FILE);
                         if(!me_info.is_open()) {
                             throw std::invalid_argument("me.info not found");
                         }
                         code = RequestCodes::SIGN_IN;
                         std::getline(me_info, payload);//TODO - decide if to add a check to users name
+                        std::string hex_string;
+                        std::getline(me_info, hex_string);
+                        std::string line;
+                        while(std::getline(me_info, line))//TODO - this needs to be read from priv.key
+                            private_key += line;
                         me_info.close();
+
+                        for (size_t i = 0; i < client_id.size(); ++i) {
+                            client_id[i] = hex_to_byte(hex_string.substr(i * 2, 2));
+                        }
                     }
                     else {// Performing sign up
-                        port = s.getPort();
-                        host = s.getHost();
                         client_name = s.getName();
                         payload = s.getName();
                     }
+
+                    port = s.getPort();
+                    host = s.getHost();
+                    file_to_send = s.getFilePath();
+
                     payload.resize(255,'\0');
                 }
                 break;
@@ -611,7 +640,13 @@ public:
                 break;
 
                 case RequestCodes::SENDING_FILE: {
-                    payload = "File data";  // Add actual file data
+                    try {
+                        sendEncryptedFile(file_to_send, *this);
+                        return {}; // Assuming successful send
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error sending file: " << e.what() << std::endl;
+                        return {};
+                    }
                 }
                 break;
 
@@ -653,6 +688,74 @@ public:
     }
 };
 
+void sendEncryptedFile(const std::string& filePath, Client& client) {
+    namespace fs = std::filesystem;
+
+    const size_t PACKET_SIZE = 8192;
+    const size_t HEADER_SIZE = 267; // 4 + 4 + 2 + 2 + 255
+    const size_t MAX_PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Failed to open file: " + filePath);
+    }
+
+    // Get file size
+    file.seekg(0, std::ios::end);
+    uint32_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Read file content
+    std::vector<char> fileContent(fileSize);
+    file.read(fileContent.data(), fileSize);
+    file.close();
+
+    // Create AESWrapper using the client's decrypted AES key
+    AESWrapper aesWrapper(reinterpret_cast<const unsigned char*>(client.decrypted_aes_key.c_str()),
+                         client.decrypted_aes_key.length());
+
+    // Encrypt file content
+    std::string encryptedContent = aesWrapper.encrypt(fileContent.data(), fileSize);
+    uint32_t encryptedSize = encryptedContent.size();
+
+    // Calculate total packets
+    uint16_t totalPackets = (encryptedSize + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
+
+    // Get filename using C++17 filesystem
+    std::string filename = fs::path(filePath).filename().string();
+    if (filename.length() > 255) {
+        filename = filename.substr(0, 255);
+    } else {
+        filename.resize(255, '\0');  // Pad with nulls to exactly 255 bytes
+    }
+
+    for (uint16_t packetNum = 0; packetNum < totalPackets; ++packetNum) {
+        size_t offset = packetNum * MAX_PAYLOAD_SIZE;
+        size_t chunkSize = std::min(MAX_PAYLOAD_SIZE, encryptedContent.size() - offset);
+
+        // Construct payload
+        std::string payload;
+        payload.reserve(HEADER_SIZE + chunkSize);
+
+        // Add header information
+        payload.append(reinterpret_cast<char*>(&encryptedSize), 4);
+        payload.append(reinterpret_cast<char*>(&fileSize), 4);
+        payload.append(reinterpret_cast<char*>(&packetNum), 2);
+        payload.append(reinterpret_cast<char*>(&totalPackets), 2);
+        payload += filename;  // Already padded to 255 bytes
+
+        // Add encrypted content chunk
+        payload += encryptedContent.substr(offset, chunkSize);
+
+        // Create and send request
+        Request request(client.client_id, VERSION, static_cast<uint16_t>(RequestCodes::SENDING_FILE),
+                       static_cast<uint32_t>(payload.size()), payload);
+
+        std::string packed_request = Handler::pack(request);
+        client.send(packed_request);
+    }
+}
+
 int main() {
     try {
         Client client;
@@ -662,7 +765,15 @@ int main() {
         std::cout << "Code: " << response.getCode() << std::endl;
         std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
         std::cout << "Payload: " << response.getPayload() << std::endl;
-        request = client.request_from_server(RequestCodes::SENDING_PUBLIC_KEY);
+        if(response.getCode() != static_cast<uint16_t>(ResponseCodes::SIGN_IN_SUCCESS)) {// User is a new user
+            request = client.request_from_server(RequestCodes::SENDING_PUBLIC_KEY);
+            response = client.receive();
+            client.handle_response(response);
+            std::cout << "Code: " << response.getCode() << std::endl;
+            std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
+            std::cout << "Payload: " << response.getPayload() << std::endl;
+        }
+        request = client.request_from_server(RequestCodes::SENDING_FILE);
         response = client.receive();
         client.handle_response(response);
         std::cout << "Code: " << response.getCode() << std::endl;
