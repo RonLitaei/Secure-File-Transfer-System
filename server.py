@@ -15,7 +15,7 @@ DEFAULT_PORT = 1256
 DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
-VERSION = 1
+VERSION = 3
 UNPACK_FORMAT = "<BHI"
 PACK_FORMAT = "!BHI"
 REQUEST_HEADER_SIZE = 23
@@ -100,13 +100,37 @@ Receives requests from the server and sends the response to the server
 '''
 
 class ClientHandler:
-    error_message = b"GENERAL ERROR: Something went wrong"
+    # Payload for 1602(receiving public key and sending aes) and 1605(sign in success) is the same
+    # so this function handles both requests and issues the same response
+    def _process_1602and1605(self, response_code_success, response_code_failure):
+        payload = b""
+        encoded_name = self.request.payload[:255]
+        name = encoded_name.decode('ascii').rstrip('\0')
+        client_id = Register.data_base.get(name)
+
+        if client_id is None:
+            payload = b"1111111111111111"  # default error client id
+            self.response.set_payload_size(len(payload))
+            self.response.set_payload(payload)
+            self.response.set_code(response_code_failure)
+            return
+
+        public_key_pem = self.request.payload[255:255 + 160]
+        encrypted_aes_key, aes = encrypt_aes_key(public_key_pem)
+
+        payload = client_id
+        payload += encrypted_aes_key
+        self.response = Response(VERSION, response_code_success, len(payload), payload)
+
     def __init__(self,request):
+        error_message = b"GENERAL ERROR: Something went wrong"
         self.request = request
         # Default response in the general error response
-        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, len(self.error_message),self.error_message)
+        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, len(error_message),error_message)
 
-    # If registration succeeded, returns success code and the clients id, else returns the failure code and try again message
+    # xxx <- Request code
+    # Response code -> yyy
+    # 825 - 1600/1601
     def handle_registration(self):
         r1 = Register(self.request.payload.decode('ascii').rstrip('\0'))
         if r1.is_register_successful():
@@ -115,33 +139,15 @@ class ClientHandler:
         else:
             payload = "Register failed, Please try again."
             self.response = Response(VERSION,ResponseCodes.REGISTRATION_FAILED,len(payload),payload)
+
+    # 826 - 1602
     def handle_public_key(self):
-        payload = b""
-        encoded_name = self.request.payload[:255]
-        name = encoded_name.decode('ascii').rstrip('\0')
-        client_id = Register.data_base.get(name)
+        self._process_1602and1605(ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES, ResponseCodes.GENERAL_ERROR)
 
-        if client_id is None:
-            payload = b"Client id not found"
-            #TODO - add these methods to Response
-            #self.response.set_payloadsize(len(payload))
-            #self.response.set_payload(payload)
-            return
-
-        #TODO - this can be written in a different function
-        public_key_pem = self.request.payload[255:255 + 160]
-        encrypted_aes_key, aes = encrypt_aes_key(public_key_pem)
-        '''aes_key = get_random_bytes(32)
-        print(f"aes key is: {aes_key}")
-        public_key = RSA.import_key(public_key_pem)
-        cipher_rsa = PKCS1_OAEP.new(public_key)
-        encrypted_aes_key = cipher_rsa.encrypt(aes_key)'''
-
-        payload = client_id
-        payload += encrypted_aes_key
-        self.response = Response(VERSION,ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES,len(payload),payload)
+    # 827 - 1605/1606
     def handle_sign_in(self):
-        pass
+        self._process_1602and1605(ResponseCodes.SIGN_IN_SUCCESS, ResponseCodes.SIGN_IN_FAILED)
+
     def handle_file_received(self):
         pass
     def handle_crc_valid(self):
@@ -174,6 +180,18 @@ class Response:
         if type(self.payload) != bytes:
             return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload.encode("ascii")
         return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload
+
+    def set_version(self, version):
+        self.version = version
+
+    def set_code(self, code):
+        self.code = code
+
+    def set_payload_size(self, payload_size):
+        self.payload_size = payload_size
+
+    def set_payload(self, payload):
+        self.payload = payload
 
 '''
  +---------------+----------+-----------------------------------------------------+
@@ -300,7 +318,9 @@ class Server:
                         print(f"Stopped receiving communication from client {addr}")
                         break
                     request = Request(header)  # Translate data (header at this point) to request object
-
+                    '''
+                    if the request code is 828, the payload receiving needs to be different
+                    '''
                     # Time to initialize the payload
                     payload = b""
                     bytes_received = 0
