@@ -1,0 +1,535 @@
+import base64
+import os
+import socket
+import threading
+import struct
+import uuid
+from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
+from enum import Enum
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+HOST = ''
+DEFAULT_PORT = 1256
+DEFAULT_PORT_FILE = "port.info"
+PACKET_SIZE = 1024
+SERVER_MAX_CONNECTIONS = 50
+VERSION = 3
+UNPACK_FORMAT = "<BHI"
+PACK_FORMAT = "!BHI"
+REQUEST_HEADER_SIZE = 23
+MAX_REQUEST_SIZE = 1073741847 #1GB payload + 23 bytes for the header
+
+
+def encrypt_aes_key(public_key_pem):
+    try:
+        # Generate a random 256-bit AES key
+        aes_key = get_random_bytes(32)
+        print(f"AES key (base64): {base64.b64encode(aes_key).decode('utf-8')}")
+
+        # Import the public key
+        public_key = RSA.import_key(public_key_pem)
+
+        # Create cipher object and encrypt the AES key
+        cipher_rsa = PKCS1_OAEP.new(public_key)
+        encrypted_aes_key = cipher_rsa.encrypt(aes_key)
+
+        print(f"Encrypted AES key (base64): {base64.b64encode(encrypted_aes_key).decode('utf-8')}")
+        return encrypted_aes_key, aes_key
+
+    except ValueError as e:
+        print(f"Error importing key or encrypting: {str(e)}")
+        return None, None
+
+def handle_exceptions(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ValueError:
+            return None
+    return wrapper
+
+class RequestCodes(Enum):
+    REGISTRATION = 825
+    SENDING_PUBLIC_KEY = 826
+    SIGN_IN = 827
+    SENDING_FILE = 828
+    CRC_VALID = 900
+    CRC_NOT_VALID = 901
+    CRC_EXCEEDED_TRIES = 902
+
+class ResponseCodes(Enum):
+    REGISTRATION_SUCCESS = 1600
+    REGISTRATION_FAILED = 1601
+    PUBLIC_KEY_RECEIVED_SENDING_AES = 1602
+    FILE_RECEIVED = 1603
+    MESSAGE_RECEIVED = 1604
+    SIGN_IN_SUCCESS = 1605
+    SIGN_IN_FAILED = 1606
+    GENERAL_ERROR = 1607
+
+class Register:
+    data_base = {}
+
+    def __init__(self, clients_name):
+        if self.check_client_name(clients_name):
+            self.clients_name = clients_name
+            self.register_successful = True
+            self.client_id = self.generate_id()
+            Register.data_base.update({clients_name : self.client_id})
+        else:
+            self.register_successful = False
+
+    def check_client_name(self,clients_name):
+        if clients_name in Register.data_base:
+            return False
+        return True
+
+    def generate_id(self):
+        id = uuid.uuid4().hex
+        return bytes.fromhex(id)
+
+    def is_register_successful(self):
+        return self.register_successful
+
+    def get_client_id(self):
+        return self.client_id
+'''
+Receives requests from the server and sends the response to the server  
+'''
+
+class ClientHandler:
+    # Payload for 1602(receiving public key and sending aes) and 1605(sign in success) is the same
+    # so this function handles both requests and issues the same response
+    def _process_1602and1605(self, response_code_success, response_code_failure):
+        payload = b""
+        encoded_name = self.request.payload[:255]
+        name = encoded_name.decode('ascii').rstrip('\0')
+        client_id = Register.data_base.get(name)
+
+        if client_id is None:
+            payload = b"1111111111111111"  # default error client id
+            self.response.set_payload_size(len(payload))
+            self.response.set_payload(payload)
+            self.response.set_code(response_code_failure)
+            return
+        #TODO - if its 1605, need to extract the public key from data base and not payload
+        if response_code_success == ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES:
+            public_key = self.request.payload[255:255 + 160]
+        else:
+            public_key = self.public_key
+        encrypted_aes_key, aes = encrypt_aes_key(public_key)
+
+        payload = client_id
+        payload += encrypted_aes_key
+        self.response = Response(VERSION, response_code_success, len(payload), payload)
+        self.aes_key = aes
+        self.public_key = public_key
+
+    def __init__(self,request):
+        error_message = b"GENERAL ERROR: Something went wrong"
+        self.request = request
+        # Default response in the general error response
+        self.response = Response(VERSION, ResponseCodes.GENERAL_ERROR, len(error_message),error_message)
+        self.aes_key = b""
+        self.public_key = b""
+
+    def get_aes_key(self):
+        return self.aes_key
+
+    def get_public_key(self):
+        return self.public_key
+    # xxx <- Request code
+    # Response code -> yyy
+    # 825 - 1600/1601
+    def handle_registration(self):
+        r1 = Register(self.request.payload.decode('ascii').rstrip('\0'))
+        if r1.is_register_successful():
+            payload = r1.get_client_id()
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_SUCCESS,len(payload),payload)
+        else:
+            payload = "Register failed, Please try again."
+            self.response = Response(VERSION,ResponseCodes.REGISTRATION_FAILED,len(payload),payload)
+
+    # 826 - 1602
+    def handle_public_key(self):
+        self._process_1602and1605(ResponseCodes.PUBLIC_KEY_RECEIVED_SENDING_AES, ResponseCodes.GENERAL_ERROR)
+
+    # 827 - 1605/1606
+    def handle_sign_in(self):
+        self._process_1602and1605(ResponseCodes.SIGN_IN_SUCCESS, ResponseCodes.SIGN_IN_FAILED)
+
+    def handle_file_received(self):
+        pass
+    def handle_crc_valid(self):
+        pass
+    def handle_crc_not_valid(self):
+        pass
+    def handle_crc_exceeded_tries(self):
+        pass
+
+class Response:
+    def __init__(self, version, code, payload_size, payload):
+        self.version = version
+        self.code = code
+        self.payload_size = payload_size
+        self.payload = payload
+
+    def pack_response(self):
+        if type(self.payload) != bytes:
+            return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload.encode("ascii")
+        return struct.pack(PACK_FORMAT, self.version, self.code.value, self.payload_size) + self.payload
+
+    def set_version(self, version):
+        self.version = version
+
+    def set_code(self, code):
+        self.code = code
+
+    def set_payload_size(self, payload_size):
+        self.payload_size = payload_size
+
+    def set_payload(self, payload):
+        self.payload = payload
+
+
+# To use this class, first you must receive data that contains only the header using unpack_header,
+# later set the payload.
+# Payload is raw bytes, decode later in what you need
+class Request:
+    def __init__(self, data):
+        unpacked_data = self.unpack_header(data)
+        self.client_id = unpacked_data['client_id']
+        self.version = unpacked_data['version']
+        self.code = unpacked_data['code']
+        self.payload_size = unpacked_data['payload_size']
+        self.payload = None
+
+    def __str__(self):
+        return (f"Request(Client ID: {self.client_id}, Version: {self.version}, "
+                f"Code: {self.code}, Payload Size: {self.payload_size}, "
+                f"Payload: {self.payload})")
+
+    # Unpacks header from raw data, should be REQUEST_HEADER_SIZE - 23 bytes
+    def unpack_header(self, data):
+        header_size = len(data[:REQUEST_HEADER_SIZE])
+        if header_size != REQUEST_HEADER_SIZE:
+            raise ValueError(f"Invalid header size: {header_size}. {REQUEST_HEADER_SIZE} bytes expected.")
+        client_id = data[:16]#TODO - change values to consts
+        data = data[16:]
+        version, code, payload_size = struct.unpack(UNPACK_FORMAT, data[:7])
+        try:
+            code_enum = RequestCodes(code)
+        except ValueError:
+            raise ValueError(f"Invalid request code: {code}")
+
+        return {
+            'client_id': client_id,
+            'version': version,
+            'code': code_enum,
+            'payload_size': payload_size,
+        }
+
+    # sets the payload in bytes, make sure to pass the whole data and not chunks of it
+    def set_payload(self, data):
+        if len(data) != self.payload_size:
+            raise ValueError(f"Incomplete payload: expected {self.payload_size} bytes, got {len(data)} bytes.")
+        self.payload = data
+
+'''
+Class Server - handles client connections.
+Can be started, shutdown and show its status.
+Using ipv4 and TCP/IP
+'''
+
+
+class FileReceiver:
+    HEADER_SIZE = 267  # 4 + 4 + 2 + 2 + 255
+
+    def __init__(self):
+        self.current_file_infos = {}  # Dictionary to store file info for each client
+        self.lock = threading.Lock()  # Thread safety for shared resources
+
+    def decrypt_data(self, encrypted_data: bytes, aes_key: bytes) -> bytes:
+        iv = b'\x00' * 16
+        cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+        return cipher.decrypt(encrypted_data)
+
+    def parse_header(self, header_data: bytes) -> tuple:
+        if len(header_data) != self.HEADER_SIZE:
+            raise ValueError(f"Invalid header size: {len(header_data)}")
+
+        encrypted_size, original_size = struct.unpack('<II', header_data[:8])
+        packet_num, total_packets = struct.unpack('<HH', header_data[8:12])
+        filename = header_data[12:267].rstrip(b'\x00').decode('utf-8')
+
+        return encrypted_size, original_size, packet_num, total_packets, filename
+
+    def handle_file_packet(self, packet_data: bytes, client_id: str, aes_key: bytes) -> bool:
+        try:
+            header = packet_data[:self.HEADER_SIZE]
+            encrypted_size, original_size, packet_num, total_packets, filename = self.parse_header(header)
+            encrypted_content = packet_data[self.HEADER_SIZE:self.HEADER_SIZE + encrypted_size]
+
+            with self.lock:
+                if client_id not in self.current_file_infos:
+                    self.current_file_infos[client_id] = {
+                        'filename': filename,
+                        'original_size': original_size,
+                        'total_packets': total_packets,
+                        'received_packets': {},
+                        'aes_key': aes_key
+                    }
+
+                self.current_file_infos[client_id]['received_packets'][packet_num] = encrypted_content
+
+            logger.info(f"Client {client_id}: Received packet {packet_num + 1}/{total_packets} for file {filename}")
+
+            # Check if file is complete
+            with self.lock:
+                if len(self.current_file_infos[client_id]['received_packets']) == total_packets:
+                    self.save_complete_file(client_id)
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error processing packet for client {client_id}: {e}")
+            return False
+
+    def save_complete_file(self, client_id: str):
+        with self.lock:
+            if client_id not in self.current_file_infos:
+                return
+
+            try:
+                file_info = self.current_file_infos[client_id]
+                all_encrypted_data = b''
+                for i in range(file_info['total_packets']):
+                    if i not in file_info['received_packets']:
+                        raise ValueError(f"Missing packet {i}")
+                    all_encrypted_data += file_info['received_packets'][i]
+
+                decrypted_data = self.decrypt_data(all_encrypted_data, file_info['aes_key'])
+                decrypted_data = decrypted_data[:file_info['original_size']]
+
+                output_filename = f"received_{client_id}_{file_info['filename']}"
+                with open(output_filename, 'wb') as f:
+                    f.write(decrypted_data)
+
+                logger.info(f"File saved successfully as {output_filename} for client {client_id}")
+                del self.current_file_infos[client_id]
+
+            except Exception as e:
+                logger.error(f"Error saving complete file for client {client_id}: {e}")
+
+class Server:
+    REQUEST_HEADER_SIZE = 23
+    PACKET_SIZE = 8192
+
+    def __init__(self, HOST, PORT):
+        self.HOST = HOST
+        self.PORT = PORT
+        self.VERSION = VERSION
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.active = False
+        self.file_receiver = FileReceiver()
+        self.client_ids = {}
+        self.clients_threads = {}
+        self.clients_aes_keys = {}
+        self.clients_public_keys = {}
+        self.lock = threading.Lock()
+
+    def client_handler(self, conn, addr):
+        client = f"{addr[0]}:{addr[1]}"
+        logger.info(f"New client connected: {client}")
+        client_aes_key = None
+
+        try:
+            while self.active:
+                # First, receive the standard header
+                header = conn.recv(self.REQUEST_HEADER_SIZE)
+                if not header:
+                    logger.info(f"Client {client} disconnected")
+                    break
+
+                request = Request(header)
+                client_id = request.client_id
+
+                # Handle different request types
+                if request.code == RequestCodes.SENDING_PUBLIC_KEY:
+                    # Handle key exchange and get AES key
+                    payload = self.receive_regular_payload(conn, request.payload_size)
+                    request.set_payload(payload)
+                    handler = ClientHandler(request)
+                    handler.handle_public_key()
+                    client_aes_key = handler.get_aes_key()
+                    client_public_key = handler.get_public_key()
+
+                    with self.lock:
+                        self.clients_aes_keys[client_id] = client_aes_key
+                        self.clients_public_keys[client_id] = client_public_key
+
+                    conn.sendall(handler.response.pack_response())
+
+                elif request.code == RequestCodes.SENDING_FILE:
+                    if client_aes_key is None:
+                        logger.error(f"Client {client} attempted file transfer without key exchange")
+                        break
+                    self.handle_file_transfer(conn, client, client_aes_key)
+                    # TODO - add response here
+                else:
+                    # Handle other request types
+                    payload = self.receive_regular_payload(conn, request.payload_size)
+                    request.set_payload(payload)
+                    handler = ClientHandler(request)
+
+                    request_code_to_handler = {
+                        RequestCodes.REGISTRATION: handler.handle_registration,
+                        RequestCodes.SIGN_IN: handler.handle_sign_in,
+                        RequestCodes.CRC_VALID: handler.handle_crc_valid,
+                        RequestCodes.CRC_NOT_VALID: handler.handle_crc_not_valid,
+                        RequestCodes.CRC_EXCEEDED_TRIES: handler.handle_crc_exceeded_tries,
+                    }
+
+                    handler_func = request_code_to_handler.get(request.code)
+                    if handler_func:
+                        handler_func()
+                        conn.sendall(handler.response.pack_response())
+
+        except (ConnectionResetError, ConnectionAbortedError):
+            logger.info(f"Client {client} disconnected unexpectedly")
+        except Exception as err:
+            logger.error(f"Error handling client {client}: {err}")
+        finally:
+            with self.lock:
+                if client in self.clients_threads:
+                    del self.clients_threads[client]
+                if client_id in self.clients_aes_keys:
+                    del self.clients_aes_keys[client_id]
+            conn.close()
+            logger.info(f"Connection closed for client {client_id}")
+
+    def handle_file_transfer(self, conn, client_id: str, aes_key: bytes):
+        try:
+            current_file = None
+            expected_packets = 0
+            received_packets = 0
+
+            while True:
+                # Receive header for this packet
+                header_data = self.receive_exact(conn, FileReceiver.HEADER_SIZE)
+                if not header_data:
+                    break
+
+                # Parse header
+                content_size, orig_file_size, packet_num, total_packets, filename\
+                    = FileReceiver.parse_header(header_data)
+
+                if current_file is None:
+                    current_file = filename
+                    expected_packets = total_packets
+                    logger.info(f"Starting transfer of file: {filename}, expecting {total_packets} packets")
+
+                # Receive the packet content
+                # The last message from the client needs to be padded to PACKET_SIZE
+                encrypted_content = self.receive_exact(conn, content_size/total_packets)
+                if not encrypted_content:
+                    logger.error(f"Failed to receive packet content for packet {packet_num + 1}")
+                    break
+
+                # Process this packet
+                full_packet = header_data + encrypted_content
+                file_complete = self.file_receiver.handle_file_packet(full_packet, client_id, aes_key)
+
+                received_packets += 1
+                logger.debug(f"Received packet {packet_num + 1}/{total_packets} for file: {filename}")
+
+                if file_complete or received_packets == expected_packets:
+                    logger.info(f"File transfer completed for {filename}")
+                    break
+
+        except Exception as e:
+            logger.error(f"Error handling file transfer for client {client_id}: {e}")
+
+    def receive_exact(self, conn, size):
+        data = b''
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    def receive_regular_payload(self, conn, payload_size):
+        return self.receive_exact(conn, payload_size)
+
+    def start(self):
+        self.sock.bind((self.HOST, self.PORT))
+        self.sock.listen()
+        self.active = True
+        logger.info(f"Server listening on {self.HOST}:{self.PORT}")
+
+        try:
+            while self.active:
+                conn, addr = self.sock.accept()
+                client_thread = threading.Thread(target=self.client_handler, args=(conn, addr))
+                client_id = f"{addr[0]}:{addr[1]}"
+
+                with self.lock:
+                    self.clients[client_id] = client_thread
+
+                client_thread.start()
+        except Exception as e:
+            logger.error(f"Error in server main loop: {e}")
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        self.active = False
+        logger.info("Shutting down server...")
+
+        with self.lock:
+            for client_id, thread in self.clients.items():
+                logger.info(f"Waiting for client {client_id} to finish...")
+                thread.join()
+
+        self.sock.close()
+        logger.info("Server shutdown complete")
+
+# Safely opens a file for reading only
+def open_safe(file):
+    if os.path.isfile(file):
+        f = open(file, 'r')
+        if f.readable():
+            return f
+        f.close()
+    return None
+
+def analyze_port(file):
+    f = open_safe(file)
+    if f:
+        port = f.readline().strip()
+        f.close()
+        if port.isdigit():
+            port = int(port)
+            if 0 <= port <= 65535:
+                return port
+    return DEFAULT_PORT
+
+def main():
+    port = analyze_port(DEFAULT_PORT_FILE)
+    server = Server("localhost", port)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        logger.info("Server stopping due to keyboard interrupt...")
+        server.shutdown()
+
+if __name__ == "__main__":
+    main()
