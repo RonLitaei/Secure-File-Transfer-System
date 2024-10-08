@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
 from enum import Enum
 import logging
@@ -81,6 +81,14 @@ class SecurityManager:
         with self._lock:
             return self.clients.get(client_name)
 
+    def get_client_name(self, client_id: bytes = None, public_key: bytes = None) -> Optional[str]:
+        with self._lock:
+            for client_name, client_info in self.clients.items():
+                if client_info.client_id == client_id or (
+                        public_key is not None and client_info.public_key == public_key):
+                    return client_name
+            return None
+
     def set_client_keys(self, client_name: str, public_key: bytes) -> Tuple[bytes, bytes]:
         aes_key = get_random_bytes(AES_KEY_SIZE)
         rsa_key = RSA.import_key(public_key)
@@ -94,11 +102,92 @@ class SecurityManager:
 
         return encrypted_aes_key, aes_key
 
+class FileReceiver:
+    HEADER_SIZE = 267  # 4 + 4 + 2 + 2 + 255
+
+    def __init__(self):
+        self.current_file_infos = {}  # Dictionary to store file info for each client
+        self.lock = threading.Lock()  # Thread safety for shared resources
+
+    def decrypt_data(self, encrypted_data: bytes, aes_key: bytes) -> bytes:
+        iv = b'\x00' * 16
+        cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+        return cipher.decrypt(encrypted_data)
+
+    def parse_header(self, header_data: bytes) -> tuple:
+        if len(header_data) != self.HEADER_SIZE:
+            raise ValueError(f"Invalid header size: {len(header_data)}")
+
+        encrypted_size, original_size = struct.unpack('<II', header_data[:8])
+        packet_num, total_packets = struct.unpack('<HH', header_data[8:12])
+        filename = header_data[12:267].rstrip(b'\x00').decode('ascii')
+
+        return encrypted_size, original_size, packet_num, total_packets, filename
+
+    def handle_file_packet(self, packet_data: bytes, client_id: str, aes_key: bytes) -> bool:
+        try:
+            header = packet_data[:self.HEADER_SIZE]
+            encrypted_size, original_size, packet_num, total_packets, filename = self.parse_header(header)
+            encrypted_content = packet_data[self.HEADER_SIZE:self.HEADER_SIZE + encrypted_size]
+
+            with self.lock:
+                if client_id not in self.current_file_infos:
+                    self.current_file_infos[client_id] = {
+                        'filename': filename,
+                        'original_size': original_size,
+                        'total_packets': total_packets,
+                        'received_packets': {},
+                        'aes_key': aes_key
+                    }
+
+                self.current_file_infos[client_id]['received_packets'][packet_num] = encrypted_content
+
+            logger.info(f"Client {client_id}: Received packet {packet_num + 1}/{total_packets} for file {filename}")
+
+            # Check if file is complete
+            with self.lock:
+                if len(self.current_file_infos[client_id]['received_packets']) == total_packets:
+                    self.save_complete_file(client_id)
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error processing packet for client {client_id}: {e}")
+            return False
+
+    def save_complete_file(self, client_id: str):
+        with self.lock:
+            if client_id not in self.current_file_infos:
+                return
+
+            try:
+                file_info = self.current_file_infos[client_id]
+                all_encrypted_data = b''
+                for i in range(file_info['total_packets']):
+                    if i not in file_info['received_packets']:
+                        raise ValueError(f"Missing packet {i}")
+                    all_encrypted_data += file_info['received_packets'][i]
+
+                decrypted_data = self.decrypt_data(all_encrypted_data, file_info['aes_key'])
+                decrypted_data = decrypted_data[:file_info['original_size']]
+
+                output_filename = f"received_{client_id}_{file_info['filename']}"
+                with open(output_filename, 'wb') as f:
+                    f.write(decrypted_data)
+
+                logger.info(f"File saved successfully as {output_filename} for client {client_id}")
+                del self.current_file_infos[client_id]
+
+            except Exception as e:
+                logger.error(f"Error saving complete file for client {client_id}: {e}")
+
 
 class FileManager:
     def __init__(self, base_path: Path = Path("received_files")):
         self.base_path = base_path
         self.base_path.mkdir(exist_ok=True)
+        self.file_receiver = FileReceiver()
 
     def save_file(self, filename: str, data: bytes, client_id: str) -> Path:
         safe_filename = Path(filename).name  # Remove any path components
@@ -108,7 +197,6 @@ class FileManager:
         file_path = client_folder / safe_filename
         file_path.write_bytes(data)
         return file_path
-
 
 class Server:
     def __init__(self, host: str = HOST, port: int = DEFAULT_PORT):
@@ -227,7 +315,7 @@ class Server:
         return bytes(data)
 
     def _handle_registration(self, request: dict, client_addr: str) -> dict:
-        client_name = request['payload'].decode('utf-8').rstrip('\0')
+        client_name = request['payload'].decode('ascii').rstrip('\0')
         client_id = self.security_manager.register_client(client_name)
 
         if client_id:
@@ -287,13 +375,56 @@ class Server:
 
     def _handle_file(self, request: dict, client_addr: str) -> dict:
         try:
-            # This is a placeholder implementation
-            # You'll need to implement actual file handling logic
+            current_file = None
+            expected_packets = 0
+            received_packets = 0
+
+            client_id = request.get('client_id')
+            client_name = self.security_manager.get_client_name(client_id)
+            aes_key = self.security_manager.get_client_info(client_name).aes_key
+            if client_name is None or aes_key is None:
+                logger.error(f"Client {client_id} not registered or has no aes key")
+                return self._create_error_response("Client not registered or no AES key")
+
+            while True:
+                # Receive header for this packet
+                header_data = self._receive_exact(self.sock, FileReceiver.HEADER_SIZE)
+                if not header_data:
+                    break
+
+                # Parse header
+                content_size, orig_file_size, packet_num, total_packets, filename \
+                    = FileReceiver.parse_header(header_data)
+
+                if current_file is None:
+                    current_file = filename
+                    expected_packets = total_packets
+                    logger.info(f"Starting transfer of file: {filename}, expecting {total_packets} packets")
+
+                # Receive the packet content
+                # The last message from the client needs to be padded to PACKET_SIZE
+                encrypted_content = self._receive_exact(self.sock, content_size / total_packets)
+                if not encrypted_content:
+                    logger.error(f"Failed to receive packet content for packet {packet_num + 1}")
+                    break
+
+                # Process this packet
+                full_packet = header_data + encrypted_content
+                file_complete = self.file_manager.file_receiver.handle_file_packet(full_packet, client_id, aes_key)
+
+                received_packets += 1
+                logger.debug(f"Received packet {packet_num + 1}/{total_packets} for file: {filename}")
+
+                if file_complete or received_packets == expected_packets:
+                    logger.info(f"File transfer completed for {filename}")
+                    break
+
             return {
                 'version': VERSION,
                 'code': ResponseCodes.FILE_RECEIVED,
                 'payload': b"File received successfully"
             }
+
         except Exception as e:
             logger.error(f"Error handling file: {e}")
             return self._create_error_response("Failed to process file")
@@ -306,7 +437,7 @@ class Server:
         return {
             'version': VERSION,
             'code': ResponseCodes.GENERAL_ERROR,
-            'payload': message.encode('utf-8')
+            'payload': message.encode('ascii')
         }
 
 
