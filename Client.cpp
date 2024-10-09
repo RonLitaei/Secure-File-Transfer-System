@@ -15,7 +15,7 @@
 #include "AESWrapper.h"
 
 class Client;
-const uint8_t VERSION = 1;
+const uint8_t VERSION = 3;
 const uint8_t HEADER_SIZE = 7;
 //Positions in the buffer from the data that is being received
 const uint8_t VERSION_POSITION = 0;
@@ -49,6 +49,7 @@ enum class ResponseCodes : uint16_t {
 std::string TRANSFER_INFO_FILE_NAME = "transfer.info";
 std::string USER_DATA_FILE_NAME = "transfer.info";
 static constexpr const char* ME_FILE = "info.me";
+static constexpr const char* PRIV_KEY_FILE = "priv.key";
 
 void printAESKey(const std::string& aes_key) {
     // 1. Print as hex
@@ -138,6 +139,17 @@ static bool me_info_exists() {
     me_file.close();
     return status;
 }
+void save_to_privkey_file(const std::string& priv_key) {
+    std::ofstream priv_key_file("priv.key");
+    if (!priv_key_file.is_open()) {
+        throw std::runtime_error("Could not open private key file");
+    }
+
+    std::string priv_key_base64 = Base64Wrapper::encode(priv_key);
+    priv_key_file << priv_key_base64 << std::endl;
+    priv_key_file.close();
+}
+
 class SignUp {
     static constexpr const char* TRANSFER_FILE = R"(C:\Users\Ron\Desktop\Defensive Programming\mmn15\Client 2.0\transfer.info)";
 
@@ -429,6 +441,7 @@ public:
     }
 
     // Unpacks data received via the network
+    /*
     static Response unPackHeader(const std::vector<uint8_t>& data) {
         Response response;
 
@@ -445,8 +458,29 @@ public:
         response.setStatus(true);
 
         return response;
-    }
+    }*/
+    static Response unPackHeader(const std::vector<uint8_t>& data) {
+        Response response;
 
+        if (data.size() < HEADER_SIZE) {
+            throw std::runtime_error("Header size invalid...");
+        }
+
+        // Deserialize the fields from big-endian byte order
+        uint8_t version = data[VERSION_POSITION];
+        uint16_t code = (data[CODE_POSITION] << 8) | data[CODE_POSITION+1];
+        uint32_t payload_size = (data[PAYLOAD_SIZE_POSITION] << 24)
+            | (data[PAYLOAD_SIZE_POSITION+1] << 16)
+            | (data[PAYLOAD_SIZE_POSITION+2] << 8)
+            | data[PAYLOAD_SIZE_POSITION+3];
+
+        response.setVersion(version);
+        response.setCode(code);
+        response.setPayloadSize(payload_size);
+        response.setStatus(true);
+
+        return response;
+    }
     static std::string unPackPayload(const std::vector<uint8_t>& data) {
         return std::string(data.begin(), data.end());
     }
@@ -503,7 +537,8 @@ public:
             }
             break;
             case ResponseCodes::PUBLIC_KEY_RECEIVED_SENDING_AES: {
-                save_to_me_file(client_id,client_name,private_key);//TODO - uncomment later
+                save_to_me_file(client_id,client_name,private_key);
+                save_to_privkey_file(private_key);
                 std::string encrypted_aes_key;
                 for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
                     encrypted_aes_key += response.getPayload()[i];
@@ -512,7 +547,15 @@ public:
                 decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
             }
             break;
-            case ResponseCodes::SIGN_IN_SUCCESS:{}
+            case ResponseCodes::SIGN_IN_SUCCESS: {
+                std::string encrypted_aes_key;
+                for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
+                    encrypted_aes_key += response.getPayload()[i];
+                }
+
+                RSAPrivateWrapper wrapper(Base64Wrapper::decode(private_key));
+                decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
+            }
             break;
             case ResponseCodes::SIGN_IN_FAILED:{}
             break;
@@ -565,8 +608,6 @@ public:
         // Updating the Response object with the payload
         response.setPayload(std::string(payload_vector.begin(), payload_vector.end()));
 
-        std::cout << "Response data is: " << response.getPayload() << std::endl;
-
         return response;
     }
 
@@ -591,18 +632,26 @@ public:
             switch (code) {
                 case RequestCodes::REGISTRATION: {
                     SignUp s;
-                    if (me_info_exists()){// Performing sign in
+                    if (me_info_exists()) {
+                        // Performing sign in
                         std::ifstream me_info(ME_FILE);
                         if(!me_info.is_open()) {
                             throw std::invalid_argument("me.info not found");
+                        }
+                        std::ifstream priv_key_file(PRIV_KEY_FILE);
+                        if(!priv_key_file.is_open()) {
+                            throw std::invalid_argument("priv_key not found");
                         }
                         code = RequestCodes::SIGN_IN;
                         std::getline(me_info, payload);//TODO - decide if to add a check to users name
                         std::string hex_string;
                         std::getline(me_info, hex_string);
                         std::string line;
-                        while(std::getline(me_info, line))//TODO - this needs to be read from priv.key
+                        while(std::getline(priv_key_file, line)){//TODO - this needs to be read from priv.key
+                            if(line.empty())
+                                break;
                             private_key += line;
+                        }
                         me_info.close();
 
                         for (size_t i = 0; i < client_id.size(); ++i) {
@@ -696,9 +745,10 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
     const size_t PACKET_SIZE = 8192;
     const size_t MAX_PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE;
 
-    std::ifstream file(filePath, std::ios::binary);
-    if (!file) {
-        throw std::runtime_error("Failed to open file: " + filePath);
+    fs::path absolutePath = fs::absolute(filePath);
+    std::ifstream file(absolutePath, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + absolutePath.string());
     }
 
     // Get file size
@@ -716,6 +766,7 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
                          client.decrypted_aes_key.length());
 
     // Encrypt file content
+
     std::string encryptedContent = aesWrapper.encrypt(fileContent.data(), fileSize);
     uint32_t encryptedSize = encryptedContent.size();
 
@@ -792,8 +843,5 @@ int main() {
         std::cerr << "Error: " << e.what() << std::endl;
     }
 
-
-
     return 0;
 }
-
