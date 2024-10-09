@@ -18,12 +18,12 @@ DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
 VERSION = 3
-UNPACK_HEADER_FORMAT = "<BHI"  # Network byte order (big-endian)
+UNPACK_HEADER_FORMAT = "<BHI"
 PACK_HEADER_FORMAT = "!BHI"
 REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847  # 1GB payload + 23 bytes for header
-AES_KEY_SIZE = 32  # 256 bits
-AES_BLOCK_SIZE = 16  # 128 bits
+AES_KEY_SIZE = 32
+AES_BLOCK_SIZE = 16
 
 # Configure logging
 logging.basicConfig(
@@ -244,7 +244,7 @@ class Server:
                 if request is None:
                     break
 
-                response = self._process_request(request, client_addr)
+                response = self._process_request(request, client_addr, conn)
                 self._send_response(conn, response)
         except Exception as e:
             logger.error(f"Error handling client {client_addr}: {e}")
@@ -277,17 +277,21 @@ class Server:
             logger.error(f"Error receiving request: {e}")
             return None
 
-    def _process_request(self, request: dict, client_addr: str) -> dict:
+    def _process_request(self, request: dict, client_addr: str, conn: socket.socket) -> dict:
         try:
             handlers = {
-                RequestCodes.REGISTRATION: self._handle_registration,
-                RequestCodes.SENDING_PUBLIC_KEY: self._handle_public_key,
-                RequestCodes.SIGN_IN: self._handle_sign_in,
-                RequestCodes.SENDING_FILE: self._handle_file
+                # Lambda is to discard the third argument, conn, used for handling file.
+                # The functions that don't need it receive it, but ignore it
+                RequestCodes.REGISTRATION: lambda r, a, c: self._handle_registration(r, a),
+                RequestCodes.SENDING_PUBLIC_KEY: lambda r, a, c: self._handle_public_key(r, a),
+                RequestCodes.SIGN_IN: lambda r, a, c: self._handle_sign_in(r, a),
+                RequestCodes.SENDING_FILE: self._handle_file,
+                # Default handler
+                None: lambda r, a, c: self._handle_unknown(r, a)
             }
 
-            handler = handlers.get(request['code'], self._handle_unknown)
-            return handler(request, client_addr)
+            handler = handlers.get(request['code'], handlers[None])
+            return handler(request, client_addr, conn)
         except Exception as e:
             logger.error(f"Error processing request: {e}")
             return self._create_error_response("Internal server error")
@@ -352,11 +356,9 @@ class Server:
             client_name = request['payload'][:255].decode('ascii').rstrip('\0')
             client_info = self.security_manager.get_client_info(client_name)
 
-            if client_info and client_info.aes_key and client_info.public_key:
+            if client_info and client_info.public_key:
                 # Re-encrypt the AES key with the client's public key
-                rsa_key = RSA.import_key(client_info.public_key)
-                cipher_rsa = PKCS1_OAEP.new(rsa_key)
-                encrypted_aes_key = cipher_rsa.encrypt(client_info.aes_key)
+                encrypted_aes_key,_ = self.security_manager.set_client_keys(client_name, client_info.public_key)
 
                 payload = client_info.client_id + encrypted_aes_key
 
@@ -366,18 +368,21 @@ class Server:
                     'payload': payload
                 }
             else:
-                logger.warning(f"Sign in failed for {client_name}: missing client info or keys")
+                logger.warning(f"Sign in failed for {client_name}: missing client info or public key")
                 return self._create_error_response("Sign in failed: client not properly registered")
 
         except Exception as e:
             logger.error(f"Error handling sign in: {e}")
             return self._create_error_response("Sign in failed: internal error")
 
-    def _handle_file(self, request: dict, client_addr: str) -> dict:
+    def _handle_file(self, request: dict, client_addr: str, conn : socket.socket) -> dict:
         try:
             current_file = None
             expected_packets = 0
             received_packets = 0
+            HEADER_SIZE = 267  # 4 + 4 + 2 + 2 + 255
+            PACKET_SIZE = 8192
+            MAX_PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE
 
             client_id = request.get('client_id')
             client_name = self.security_manager.get_client_name(client_id)
@@ -388,7 +393,7 @@ class Server:
 
             while True:
                 # Receive header for this packet
-                header_data = self._receive_exact(self.sock, FileReceiver.HEADER_SIZE)
+                header_data = self._receive_exact(conn, FileReceiver.HEADER_SIZE)
                 if not header_data:
                     break
 
@@ -403,7 +408,9 @@ class Server:
 
                 # Receive the packet content
                 # The last message from the client needs to be padded to PACKET_SIZE
-                encrypted_content = self._receive_exact(self.sock, content_size / total_packets)
+                # Server side
+                chunk_size = min(MAX_PAYLOAD_SIZE, content_size - (packet_num * MAX_PAYLOAD_SIZE))
+                encrypted_content = self._receive_exact(conn, chunk_size)
                 if not encrypted_content:
                     logger.error(f"Failed to receive packet content for packet {packet_num + 1}")
                     break
