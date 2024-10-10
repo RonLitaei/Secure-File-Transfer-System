@@ -75,12 +75,15 @@ void printAESKey(const std::string& aes_key) {
 }
 
 // Helper function to convert hex string to uint8_t
-uint8_t hex_to_byte(const std::string& hex) {
+/*uint8_t hex_to_byte(const std::string& hex) {
     uint8_t byte;
     std::stringstream ss;
     ss << std::hex << hex;
     ss >> byte;
     return byte;
+}*/
+uint8_t hex_to_byte(const std::string& hex) {
+    return static_cast<uint8_t>(std::stoi(hex, nullptr, 16));
 }
 // Method to read from me.info file
 // this probably does not belong in this class
@@ -418,6 +421,7 @@ public:
 class Handler {
     // Makes a request ready to be sent via the network
 public:
+
     static std::string pack(const Request& request) {
         std::ostringstream oss;
 
@@ -440,25 +444,6 @@ public:
         return oss.str();
     }
 
-    // Unpacks data received via the network
-    /*
-    static Response unPackHeader(const std::vector<uint8_t>& data) {
-        Response response;
-
-        if (data.size() < HEADER_SIZE) { // 1 (version) + 2 (code) + 4 (payload_size) + at least 1 for payload
-            throw std::runtime_error("Header size invalid. should be "+ std::to_string(HEADER_SIZE)
-                + "bytes, received: " + std::to_string(data.size()));
-        }
-
-        // Deserialize the fields from big-endian byte order
-        response.setVersion(data[VERSION_POSITION]);
-        response.setCode((data[CODE_POSITION] << 8) | data[CODE_POSITION+1]);
-        response.setPayloadSize((data[PAYLOAD_SIZE_POSITION] << 24) | (data[PAYLOAD_SIZE_POSITION+1] << 16)
-            | (data[PAYLOAD_SIZE_POSITION+2] << 8) | data[PAYLOAD_SIZE_POSITION+3]);
-        response.setStatus(true);
-
-        return response;
-    }*/
     static Response unPackHeader(const std::vector<uint8_t>& data) {
         Response response;
 
@@ -647,12 +632,13 @@ public:
                         std::string hex_string;
                         std::getline(me_info, hex_string);
                         std::string line;
+                        me_info.close();
                         while(std::getline(priv_key_file, line)){//TODO - this needs to be read from priv.key
                             if(line.empty())
                                 break;
                             private_key += line;
                         }
-                        me_info.close();
+                        priv_key_file.close();
 
                         for (size_t i = 0; i < client_id.size(); ++i) {
                             client_id[i] = hex_to_byte(hex_string.substr(i * 2, 2));
