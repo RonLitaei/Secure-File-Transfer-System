@@ -329,7 +329,12 @@ class Server:
                 'payload': client_id
             }
         else:
-            return self._create_error_response("Registration failed")
+            return {
+                'version': VERSION,
+                'code': ResponseCodes.REGISTRATION_FAILED,
+                'payload': bytes(f"Registration failed for: '{client_name}',"
+                                 f" Please try again with a different name.", 'ascii')
+            }
 
     def _handle_public_key(self, request: dict, client_addr: str) -> dict:
         try:
@@ -369,7 +374,11 @@ class Server:
                 }
             else:
                 logger.warning(f"Sign in failed for {client_name}: missing client info or public key")
-                return self._create_error_response("Sign in failed: client not properly registered")
+                return {
+                    'version': VERSION,
+                    'code': ResponseCodes.SIGN_IN_FAILED,
+                    'payload': bytes(f"Sign in failed for '{client_name}'. Please register.", 'ascii')
+                }
 
         except Exception as e:
             logger.error(f"Error handling sign in: {e}")
@@ -389,7 +398,7 @@ class Server:
             aes_key = self.security_manager.get_client_info(client_name).aes_key
             if client_name is None or aes_key is None:
                 logger.error(f"Client {client_id} not registered or has no aes key")
-                return self._create_error_response("Client not registered or no AES key")
+                return self._create_error_response("Client not registered or has no AES key")
 
             while True:
                 # Receive header for this packet
