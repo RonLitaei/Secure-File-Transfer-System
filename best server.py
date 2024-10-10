@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import struct
@@ -103,11 +104,14 @@ class SecurityManager:
         return encrypted_aes_key, aes_key
 
 class FileReceiver:
-    HEADER_SIZE = 267  # 4 + 4 + 2 + 2 + 255
+    HEADER_SIZE = 267
 
     def __init__(self):
-        self.current_file_infos = {}  # Dictionary to store file info for each client
-        self.lock = threading.Lock()  # Thread safety for shared resources
+        self.current_file_infos = {}
+        self.lock = threading.Lock()
+        self.base_directory = os.path.join(os.path.dirname(__file__), 'received_files')
+        if not os.path.exists(self.base_directory):
+            os.makedirs(self.base_directory)
 
     def decrypt_data(self, encrypted_data: bytes, aes_key: bytes) -> bytes:
         iv = b'\x00' * 16
@@ -145,7 +149,9 @@ class FileReceiver:
             logger.info(f"Client {client_id}: Received packet {packet_num + 1}/{total_packets} for file {filename}")
 
             # Check if file is complete
+            logger.debug(f"Thread {threading.current_thread().name} attempting to acquire lock for client {client_id}")
             with self.lock:
+                logger.debug(f"Thread {threading.current_thread().name} acquired lock for client {client_id}")
                 if len(self.current_file_infos[client_id]['received_packets']) == total_packets:
                     self.save_complete_file(client_id)
                     return True
@@ -157,32 +163,30 @@ class FileReceiver:
             return False
 
     def save_complete_file(self, client_id: str):
-        with self.lock:
-            if client_id not in self.current_file_infos:
-                return
+        if client_id not in self.current_file_infos:
+            return
 
-            try:
-                file_info = self.current_file_infos[client_id]
-                all_encrypted_data = b''
-                for i in range(file_info['total_packets']):
-                    if i not in file_info['received_packets']:
-                        raise ValueError(f"Missing packet {i}")
-                    all_encrypted_data += file_info['received_packets'][i]
+        try:
+            file_info = self.current_file_infos[client_id]
+            all_encrypted_data = b''
+            for i in range(file_info['total_packets']):
+                if i not in file_info['received_packets']:
+                    raise ValueError(f"Missing packet {i}")
+                all_encrypted_data += file_info['received_packets'][i]
 
-                decrypted_data = self.decrypt_data(all_encrypted_data, file_info['aes_key'])
-                decrypted_data = decrypted_data[:file_info['original_size']]
+            decrypted_data = self.decrypt_data(all_encrypted_data, file_info['aes_key'])
+            decrypted_data = decrypted_data[:file_info['original_size']]
+            location = self.base_directory + '\\' + file_info['filename']
+            with open(location, 'wb') as f:
+                f.write(decrypted_data)
 
-                output_filename = f"received_{client_id}_{file_info['filename']}"
-                with open(output_filename, 'wb') as f:
-                    f.write(decrypted_data)
+            logger.info(f"File saved successfully as {file_info['filename']} for client {client_id}")
+            del self.current_file_infos[client_id]
 
-                logger.info(f"File saved successfully as {output_filename} for client {client_id}")
-                del self.current_file_infos[client_id]
+        except Exception as e:
+            logger.error(f"Error saving complete file for client {client_id}: {e}")
 
-            except Exception as e:
-                logger.error(f"Error saving complete file for client {client_id}: {e}")
-
-
+#TODO - probably a useless class
 class FileManager:
     def __init__(self, base_path: Path = Path("received_files")):
         self.base_path = base_path
@@ -389,7 +393,7 @@ class Server:
             current_file = None
             expected_packets = 0
             received_packets = 0
-            HEADER_SIZE = 267  # 4 + 4 + 2 + 2 + 255
+            HEADER_SIZE = 267
             PACKET_SIZE = 8192
             MAX_PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE
 
@@ -408,7 +412,7 @@ class Server:
 
                 # Parse header
                 content_size, orig_file_size, packet_num, total_packets, filename \
-                    = FileReceiver.parse_header(header_data)
+                    = self.file_manager.file_receiver.parse_header(header_data)
 
                 if current_file is None:
                     current_file = filename
