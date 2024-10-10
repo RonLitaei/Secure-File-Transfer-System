@@ -806,7 +806,13 @@ int main() {
         std::cout << "Code: " << response.getCode() << std::endl;
         std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
         std::cout << "Payload: " << response.getPayload() << std::endl;
-        if(response.getCode() != static_cast<uint16_t>(ResponseCodes::SIGN_IN_SUCCESS)) {// User is a new user
+        if(response.getCode() == static_cast<uint16_t>(ResponseCodes::SIGN_IN_FAILED)) {
+            request = client.request_from_server(RequestCodes::REGISTRATION);
+            response = client.receive();
+            client.handle_response(response);
+
+        }
+        if(response.getCode() == static_cast<uint16_t>(ResponseCodes::REGISTRATION_SUCCESS)) {// User is a new user
             request = client.request_from_server(RequestCodes::SENDING_PUBLIC_KEY);
             response = client.receive();
             client.handle_response(response);
@@ -814,6 +820,7 @@ int main() {
             std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
             std::cout << "Payload: " << response.getPayload() << std::endl;
         }
+
         request = client.request_from_server(RequestCodes::SENDING_FILE);
         response = client.receive();
         client.handle_response(response);
