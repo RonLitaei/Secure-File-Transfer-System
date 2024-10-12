@@ -13,6 +13,7 @@
 #include "Base64Wrapper.h"
 #include "RSAWrapper.h"
 #include "AESWrapper.h"
+#include "crc.h" // TODO - CREATE H FILE LATER
 
 class Client;
 const uint8_t VERSION = 3;
@@ -51,37 +52,8 @@ std::string USER_DATA_FILE_NAME = "transfer.info";
 static constexpr const char* ME_FILE = "info.me";
 static constexpr const char* PRIV_KEY_FILE = "priv.key";
 
-void printAESKey(const std::string& aes_key) {
-    // 1. Print as hex
-    std::cout << "AES Key (hex): ";
-    for (unsigned char c : aes_key) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0')
-                  << static_cast<int>(static_cast<unsigned char>(c));
-    }
-    std::cout << std::endl;
 
-    // 2. Print as Base64
-    Base64Wrapper base64;
-    std::string encoded = base64.encode(aes_key);
-    std::cout << "AES Key (Base64): " << encoded << std::endl;
 
-    // Verification: decode and compare
-    std::string decoded = base64.decode(encoded);
-    if (decoded == aes_key) {
-        std::cout << "Verification: Base64 encoding/decoding successful" << std::endl;
-    } else {
-        std::cout << "Verification: Base64 encoding/decoding mismatch!" << std::endl;
-    }
-}
-
-// Helper function to convert hex string to uint8_t
-/*uint8_t hex_to_byte(const std::string& hex) {
-    uint8_t byte;
-    std::stringstream ss;
-    ss << std::hex << hex;
-    ss >> byte;
-    return byte;
-}*/
 uint8_t hex_to_byte(const std::string& hex) {
     return static_cast<uint8_t>(std::stoi(hex, nullptr, 16));
 }
@@ -231,6 +203,7 @@ public:
     }
 };
 
+//TODO - delete this whole useless crap
 class RsaKeys {
     std::unique_ptr<RSAPrivateWrapper> _privateKeyWrapper;
     std::string _publicKey;
@@ -245,24 +218,6 @@ public:
         _base64EncodedPrivateKey = Base64Wrapper::encode(_privateKey);
     }
 
-    // ... other methods ...
-
-    // Update this method
-    void setPrivateKeyFromBase64(const std::string& base64Key) {
-        _base64EncodedPrivateKey = base64Key;
-        _privateKey = Base64Wrapper::decode(base64Key);
-        _privateKeyWrapper = std::make_unique<RSAPrivateWrapper>(_privateKey);
-    }
-
-    // Update other methods that use _privateKeyWrapper to use -> instead of .
-    RSAPublicWrapper createEncryptor() const {
-        return RSAPublicWrapper(_publicKey);
-    }
-
-    RSAPrivateWrapper createDecryptor() const {
-        std::string decodedPrivateKey = Base64Wrapper::decode(_base64EncodedPrivateKey);
-        return RSAPrivateWrapper(decodedPrivateKey);
-    }
 
     std::string getPublicKey() const {
         return _publicKey;
@@ -272,9 +227,6 @@ public:
         return _privateKey;
     }
 
-    std::string getBase64EncodedPrivateKey() const {
-        return _base64EncodedPrivateKey;
-    }
 };
 
 class SendPublicKey {
@@ -349,15 +301,6 @@ public:
     void setPayloadSize(const uint32_t payload_size) { this->payload_size = payload_size; }
     void setPayload(const std::string& payload) { this->payload = payload; }
 
-    // Display common message details
-    virtual void display() const {
-        std::cout << "Client ID: ";
-        std::cout << "\nVersion: " << static_cast<int>(version) << "\n";
-        std::cout << "Code: " << code << "\n";
-        std::cout << "Payload Size: " << payload_size << "\n";
-        std::cout << "Payload: " << payload << "\n";
-    }
-
     virtual ~Message() = default;
 };
 
@@ -382,13 +325,6 @@ public:
     // Setter for code
     void setClientID(const std::array<uint8_t,16> client_id) { this->client_id = client_id; }
 
-    // Display request details (override the base display)
-    void display() const override {
-        for (const char c : client_id) std::cout << c;
-        std::cout << std::endl;
-        Message::display();  // Call base class display
-
-    }
 };
 
 // Response from the server to the client
@@ -410,12 +346,6 @@ public:
 
     // Setter for status
     void setStatus(const uint16_t status) { this->status = status; }
-
-    // Display response details (override the base display)
-    void display() const override {
-        Message::display();  // Call base class display
-        std::cout << "Status: " << status << "\n";
-    }
 };
 
 class Handler {
@@ -466,9 +396,6 @@ public:
 
         return response;
     }
-    static std::string unPackPayload(const std::vector<uint8_t>& data) {
-        return std::string(data.begin(), data.end());
-    }
 };
 void sendEncryptedFile(const std::string& filePath, Client& client);
 
@@ -476,7 +403,6 @@ class Client {
     boost::asio::io_context io_context;
     boost::asio::ip::tcp::socket socket;
     boost::asio::ip::tcp::resolver resolver;
-    int _max_length = 1024;
 
     /*
      * usage:
@@ -724,7 +650,6 @@ public:
 };
 
 void sendEncryptedFile(const std::string& filePath, Client& client) {
-    //TODO - the main header needs to be sent only once and then each packet sent with it updated internal header
     namespace fs = std::filesystem;
 
     const size_t HEADER_SIZE = 267; // 4 + 4 + 2 + 2 + 255
@@ -747,6 +672,9 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
     file.read(fileContent.data(), fileSize);
     file.close();
 
+    unsigned long crc = memcrc(fileContent.data(), fileSize);
+    //fileContent.insert(fileContent.end(), reinterpret_cast<char*>(&crc),
+        //reinterpret_cast<char*>(&crc) + sizeof(crc));
     // Create AESWrapper using the client's decrypted AES key
     AESWrapper aesWrapper(reinterpret_cast<const unsigned char*>(client.decrypted_aes_key.c_str()),
                          client.decrypted_aes_key.length());
@@ -754,6 +682,7 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
     // Encrypt file content
 
     std::string encryptedContent = aesWrapper.encrypt(fileContent.data(), fileSize);
+    encryptedContent.append(reinterpret_cast<const char*>(&crc), sizeof(crc));
     uint32_t encryptedSize = encryptedContent.size();
 
     // Calculate total packets
@@ -791,8 +720,8 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
 
         // Add encrypted content chunk
         payload += encryptedContent.substr(offset, chunkSize);
-        if (packetNum == totalPackets - 1)
-            payload.resize(PACKET_SIZE, '\0');
+        //if (packetNum == totalPackets - 1)
+            //payload.resize(PACKET_SIZE, '\0');
         client.send(payload);
     }
 }
