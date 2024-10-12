@@ -11,6 +11,7 @@ from Crypto.Random import get_random_bytes
 from enum import Enum
 import logging
 from pathlib import Path
+import crc
 
 # Constants
 HOST = ''
@@ -128,7 +129,7 @@ class FileReceiver:
 
         return encrypted_size, original_size, packet_num, total_packets, filename
 
-    def handle_file_packet(self, packet_data: bytes, client_id: str, aes_key: bytes) -> bool:
+    def handle_file_packet(self, packet_data: bytes, client_id: bytes, aes_key: bytes) -> bool:
         try:
             header = packet_data[:self.HEADER_SIZE]
             encrypted_size, original_size, packet_num, total_packets, filename = self.parse_header(header)
@@ -162,9 +163,10 @@ class FileReceiver:
             logger.error(f"Error processing packet for client {client_id}: {e}")
             return False
 
-    def save_complete_file(self, client_id: str):
+    def save_complete_file(self, client_id: bytes) -> bool:
         if client_id not in self.current_file_infos:
-            return
+            logger.warning(f"No file info found for client {client_id}")
+            return False
 
         try:
             file_info = self.current_file_infos[client_id]
@@ -173,18 +175,30 @@ class FileReceiver:
                 if i not in file_info['received_packets']:
                     raise ValueError(f"Missing packet {i}")
                 all_encrypted_data += file_info['received_packets'][i]
+            decrypted_data = self.decrypt_data(all_encrypted_data[:-4], file_info['aes_key'])
 
-            decrypted_data = self.decrypt_data(all_encrypted_data, file_info['aes_key'])
+            # CRC
+            calculated_crc = crc.memcrc(decrypted_data[:file_info['original_size']])
+            crc_size = len(decrypted_data) - file_info['original_size']
+            file_crc = int.from_bytes(all_encrypted_data[-4:], 'little')
+            if calculated_crc != file_crc:
+                logger.error(f"Calculated CRC mismatch for client {client_id}")
+                del self.current_file_infos[client_id]
+                return False
+
             decrypted_data = decrypted_data[:file_info['original_size']]
-            location = self.base_directory + '\\' + file_info['filename']
+            location = f"{self.base_directory}\\{client_id.hex()}\\{file_info['filename']}"
+            os.makedirs(os.path.dirname(location), exist_ok=True)
             with open(location, 'wb') as f:
                 f.write(decrypted_data)
-
             logger.info(f"File saved successfully as {file_info['filename']} for client {client_id}")
             del self.current_file_infos[client_id]
+            return True
 
         except Exception as e:
             logger.error(f"Error saving complete file for client {client_id}: {e}")
+            del self.current_file_infos[client_id]
+            return False
 
 #TODO - probably a useless class
 class FileManager:
@@ -419,9 +433,6 @@ class Server:
                     expected_packets = total_packets
                     logger.info(f"Starting transfer of file: {filename}, expecting {total_packets} packets")
 
-                # Receive the packet content
-                # The last message from the client needs to be padded to PACKET_SIZE
-                # Server side
                 chunk_size = min(MAX_PAYLOAD_SIZE, content_size - (packet_num * MAX_PAYLOAD_SIZE))
                 encrypted_content = self._receive_exact(conn, chunk_size)
                 if not encrypted_content:
@@ -436,7 +447,10 @@ class Server:
                 logger.debug(f"Received packet {packet_num + 1}/{total_packets} for file: {filename}")
 
                 if file_complete or received_packets == expected_packets:
-                    logger.info(f"File transfer completed for {filename}")
+                    if not file_complete:
+                        logger.warning(f"File transfer failed for {filename}")
+                    else:
+                        logger.info(f"File transfer completed for {filename}")
                     break
 
             return {
