@@ -147,25 +147,22 @@ class FileReceiver:
 
                 self.current_file_infos[client_id]['received_packets'][packet_num] = encrypted_content
 
-            logger.info(f"Client {client_id}: Received packet {packet_num + 1}/{total_packets} for file {filename}")
+            logger.info(f"Client {client_id.hex()}: Received packet {packet_num + 1}/{total_packets} for file {filename}")
 
             # Check if file is complete
-            logger.debug(f"Thread {threading.current_thread().name} attempting to acquire lock for client {client_id}")
             with self.lock:
-                logger.debug(f"Thread {threading.current_thread().name} acquired lock for client {client_id}")
                 if len(self.current_file_infos[client_id]['received_packets']) == total_packets:
-                    self.save_complete_file(client_id)
                     return True
 
             return False
 
         except Exception as e:
-            logger.error(f"Error processing packet for client {client_id}: {e}")
+            logger.error(f"Error processing packet for client {client_id.hex()}: {e}")
             return False
 
-    def save_complete_file(self, client_id: bytes) -> bool:
+    def save_complete_file(self, client_id: bytes) -> crc.UNSIGNED:
         if client_id not in self.current_file_infos:
-            logger.warning(f"No file info found for client {client_id}")
+            logger.warning(f"No file info found for client {client_id.hex()}")
             return False
 
         try:
@@ -179,26 +176,25 @@ class FileReceiver:
 
             # CRC
             calculated_crc = crc.memcrc(decrypted_data[:file_info['original_size']])
-            crc_size = len(decrypted_data) - file_info['original_size']
             file_crc = int.from_bytes(all_encrypted_data[-4:], 'little')
             if calculated_crc != file_crc:
-                logger.error(f"Calculated CRC mismatch for client {client_id}")
+                logger.error(f"Calculated CRC mismatch for client {client_id.hex()}")
                 del self.current_file_infos[client_id]
-                return False
+            else:
+                decrypted_data = decrypted_data[:file_info['original_size']]
+                location = f"{self.base_directory}\\{client_id.hex()}\\{file_info['filename']}"
+                os.makedirs(os.path.dirname(location), exist_ok=True)
+                with open(location, 'wb') as f:
+                    f.write(decrypted_data)
+                logger.info(f"File saved successfully as {file_info['filename']} for client {client_id.hex()}")
+                del self.current_file_infos[client_id]
 
-            decrypted_data = decrypted_data[:file_info['original_size']]
-            location = f"{self.base_directory}\\{client_id.hex()}\\{file_info['filename']}"
-            os.makedirs(os.path.dirname(location), exist_ok=True)
-            with open(location, 'wb') as f:
-                f.write(decrypted_data)
-            logger.info(f"File saved successfully as {file_info['filename']} for client {client_id}")
-            del self.current_file_infos[client_id]
-            return True
+            return calculated_crc
 
         except Exception as e:
-            logger.error(f"Error saving complete file for client {client_id}: {e}")
+            logger.error(f"Error saving complete file for client {client_id.hex()}: {e}")
             del self.current_file_infos[client_id]
-            return False
+            return 0
 
 #TODO - probably a useless class
 class FileManager:
@@ -263,7 +259,8 @@ class Server:
                     break
 
                 response = self._process_request(request, client_addr, conn)
-                self._send_response(conn, response)
+                if response:
+                    self._send_response(conn, response)
         except Exception as e:
             logger.error(f"Error handling client {client_addr}: {e}")
         finally:
@@ -303,6 +300,9 @@ class Server:
                 RequestCodes.REGISTRATION: lambda r, a, c: self._handle_registration(r, a),
                 RequestCodes.SENDING_PUBLIC_KEY: lambda r, a, c: self._handle_public_key(r, a),
                 RequestCodes.SIGN_IN: lambda r, a, c: self._handle_sign_in(r, a),
+                RequestCodes.CRC_VALID: lambda r, a, c: self._handle_crc(r, a),
+                RequestCodes.CRC_NOT_VALID: lambda r, a, c: None,
+                RequestCodes.CRC_EXCEEDED_TRIES: lambda r, a, c: self._handle_crc(r, a),
                 RequestCodes.SENDING_FILE: self._handle_file,
                 # Default handler
                 None: lambda r, a, c: self._handle_unknown(r, a)
@@ -407,6 +407,9 @@ class Server:
             current_file = None
             expected_packets = 0
             received_packets = 0
+            payload = b''
+            content_size = crc = 0
+            filename = ''
             HEADER_SIZE = 267
             PACKET_SIZE = 8192
             MAX_PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE
@@ -415,7 +418,7 @@ class Server:
             client_name = self.security_manager.get_client_name(client_id)
             aes_key = self.security_manager.get_client_info(client_name).aes_key
             if client_name is None or aes_key is None:
-                logger.error(f"Client {client_id} not registered or has no aes key")
+                logger.error(f"Client {client_id.hex()} not registered or has no aes key")
                 return self._create_error_response("Client not registered or has no AES key")
 
             while True:
@@ -450,18 +453,33 @@ class Server:
                     if not file_complete:
                         logger.warning(f"File transfer failed for {filename}")
                     else:
+                        crc = self.file_manager.file_receiver.save_complete_file(client_id)
                         logger.info(f"File transfer completed for {filename}")
                     break
 
+
+            payload = (client_id + content_size.to_bytes(4,'big') +
+                       bytes(filename.ljust(255,'\0'), 'ascii') + crc.to_bytes(4, 'big'))
             return {
                 'version': VERSION,
                 'code': ResponseCodes.FILE_RECEIVED,
-                'payload': b"File received successfully"
+                'payload': payload
             }
 
         except Exception as e:
             logger.error(f"Error handling file: {e}")
             return self._create_error_response("Failed to process file")
+
+    def _handle_crc(self, request: dict, client_addr: str) -> dict:
+        client_id = request.get('client_id')
+        if self.security_manager.get_client_name(client_id) is None:
+            logger.error(f"Client {client_id.hex()} unknown")
+            return self._create_error_response("Client unknown")
+        return {
+            'version': VERSION,
+            'code' : ResponseCodes.MESSAGE_RECEIVED,
+            'payload': client_id
+        }
 
     def _handle_unknown(self, request: dict, client_addr: str) -> dict:
         return self._create_error_response(f"Unknown request code: {request['code']}")
@@ -473,7 +491,6 @@ class Server:
             'code': ResponseCodes.GENERAL_ERROR,
             'payload': message.encode('ascii')
         }
-
 
 def main():
     port = DEFAULT_PORT
