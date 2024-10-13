@@ -114,6 +114,14 @@ static bool me_info_exists() {
     me_file.close();
     return status;
 }
+
+static bool priv_key_exists() {
+    std::ifstream me_file(PRIV_KEY_FILE);
+    bool status = me_file.good();
+    me_file.close();
+    return status;
+}
+
 void save_to_privkey_file(const std::string& priv_key) {
     std::ofstream priv_key_file("priv.key");
     if (!priv_key_file.is_open()) {
@@ -398,6 +406,7 @@ public:
     }
 };
 void sendEncryptedFile(const std::string& filePath, Client& client);
+unsigned long crc_calculator(const std::string& filePath);
 
 class Client {
     boost::asio::io_context io_context;
@@ -428,6 +437,7 @@ public:
     std::string private_key;
     std::string decrypted_aes_key;
     std::string file_to_send;
+    bool crc_valid = false;
 
     void send(const std::string& message) {
         boost::asio::write(socket, boost::asio::buffer(message));
@@ -468,13 +478,36 @@ public:
                 decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
             }
             break;
-            case ResponseCodes::SIGN_IN_FAILED:{}
+            case ResponseCodes::SIGN_IN_FAILED: {
+                // delete me.info and priv.key if they exists
+                if(me_info_exists())
+                    std::remove(ME_FILE);
+
+                if(priv_key_exists())
+                    std::remove(PRIV_KEY_FILE);
+            }
             break;
-            case ResponseCodes::FILE_RECEIVED:{}
+            case ResponseCodes::FILE_RECEIVED: {
+                //take crc, compare it with what you have
+                uint32_t crc = crc_calculator(file_to_send);
+                std::string data = response.getPayload();
+                uint32_t crc_from_server = (data[275] << 24)
+                | (data[275+1] << 16)
+                | (data[275+2] << 8)
+                | data[275+3];
+
+                if(crc == crc_from_server) {
+                    crc_valid = true;
+                }
+            }
             break;
-            case ResponseCodes::MESSAGE_RECEIVED:{}
+            case ResponseCodes::MESSAGE_RECEIVED: {
+                // do nothing
+            }
             break;
-            case ResponseCodes::GENERAL_ERROR:{}
+            case ResponseCodes::GENERAL_ERROR: {
+                throw std::runtime_error("Server responded with a General error");
+            }
             break;
             default:
                 throw std::invalid_argument("ERROR: Invalid response code");
@@ -595,11 +628,6 @@ public:
                 }
                 break;
 
-                case RequestCodes::SIGN_IN: {
-                    payload = "Sign-in information";
-                }// Add actual sign-in details
-                break;
-
                 case RequestCodes::SENDING_FILE: {
                     try {
                         sendEncryptedFile(file_to_send, *this);
@@ -611,19 +639,12 @@ public:
                 }
                 break;
 
-                case RequestCodes::CRC_VALID: {
-                    payload = "CRC validation success";  // Message for successful CRC validation
-                }
-                break;
-
-                case RequestCodes::CRC_NOT_VALID: {
-                    payload = "CRC validation failed";
-                }// Message for failed CRC validation
-                break;
-
+                case RequestCodes::CRC_VALID:
+                case RequestCodes::CRC_NOT_VALID:
                 case RequestCodes::CRC_EXCEEDED_TRIES: {
-                    payload = "Exceeded CRC retry attempts";
-                }// Message for exceeding retry limit
+                    payload = file_to_send;
+                    payload.resize(255,'\0');
+                }
                 break;
 
                 default:
@@ -649,6 +670,26 @@ public:
     }
 };
 
+unsigned long crc_calculator(const std::string& filePath) {
+    std::filesystem::path absolutePath = std::filesystem::absolute(filePath);
+    std::ifstream file(absolutePath, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + absolutePath.string());
+    }
+
+    // Get file size
+    file.seekg(0, std::ios::end);
+    uint32_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Read file content
+    std::vector<char> fileContent(fileSize);
+    file.read(fileContent.data(), fileSize);
+    file.close();
+
+    return memcrc(fileContent.data(), fileSize);
+}
+
 void sendEncryptedFile(const std::string& filePath, Client& client) {
     namespace fs = std::filesystem;
 
@@ -673,8 +714,6 @@ void sendEncryptedFile(const std::string& filePath, Client& client) {
     file.close();
 
     unsigned long crc = memcrc(fileContent.data(), fileSize);
-    //fileContent.insert(fileContent.end(), reinterpret_cast<char*>(&crc),
-        //reinterpret_cast<char*>(&crc) + sizeof(crc));
     // Create AESWrapper using the client's decrypted AES key
     AESWrapper aesWrapper(reinterpret_cast<const unsigned char*>(client.decrypted_aes_key.c_str()),
                          client.decrypted_aes_key.length());
@@ -750,13 +789,33 @@ int main() {
             std::cout << "Payload: " << response.getPayload() << std::endl;
         }
 
-        request = client.request_from_server(RequestCodes::SENDING_FILE);
-        response = client.receive();
-        client.handle_response(response);
-        std::cout << "Code: " << response.getCode() << std::endl;
-        std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
-        std::cout << "Payload: " << response.getPayload() << std::endl;
+        for (size_t i = 0; i < 4; i++) {
+            request = client.request_from_server(RequestCodes::SENDING_FILE);
+            response = client.receive();
+            client.handle_response(response);
+            std::cout << "Code: " << response.getCode() << std::endl;
+            std::cout << "Payload size: " << response.getPayloadSize() << std::endl;
+            std::cout << "Payload: " << response.getPayload() << std::endl;
+            if (client.crc_valid) {
+                std::cout << "Client file: '" << client.file_to_send << "' saved successfully" << std::endl;
+                request = client.request_from_server(RequestCodes::CRC_VALID);
+                response = client.receive();
+                client.handle_response(response);
+                break;
+            }
+            request = client.request_from_server(RequestCodes::CRC_NOT_VALID);
+        }
+        if (!client.crc_valid) {
+            std::cout << "Client file: '" << client.file_to_send << "' corrupted (crc failed)" << std::endl;
+            request = client.request_from_server(RequestCodes::CRC_EXCEEDED_TRIES);
+            response = client.receive();
+            client.handle_response(response);
+        }
 
+    }
+    catch (const std::runtime_error& e) {
+        std::cerr << e.what() << std::endl;
+        //request 3 more times?
     }
     catch (const std::invalid_argument& e) {
         std::cerr << "Invalid argument: " << e.what() << std::endl;
