@@ -196,28 +196,12 @@ class FileReceiver:
             del self.current_file_infos[client_id]
             return 0
 
-#TODO - probably a useless class
-class FileManager:
-    def __init__(self, base_path: Path = Path("received_files")):
-        self.base_path = base_path
-        self.base_path.mkdir(exist_ok=True)
-        self.file_receiver = FileReceiver()
-
-    def save_file(self, filename: str, data: bytes, client_id: str) -> Path:
-        safe_filename = Path(filename).name  # Remove any path components
-        client_folder = self.base_path / client_id
-        client_folder.mkdir(exist_ok=True)
-
-        file_path = client_folder / safe_filename
-        file_path.write_bytes(data)
-        return file_path
-
 class Server:
     def __init__(self, host: str = HOST, port: int = DEFAULT_PORT):
         self.host = host
         self.port = port
         self.security_manager = SecurityManager()
-        self.file_manager = FileManager()
+        self.file_receiver = FileReceiver()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.active = False
         self._lock = threading.Lock()
@@ -429,7 +413,7 @@ class Server:
 
                 # Parse header
                 content_size, orig_file_size, packet_num, total_packets, filename \
-                    = self.file_manager.file_receiver.parse_header(header_data)
+                    = self.file_receiver.parse_header(header_data)
 
                 if current_file is None:
                     current_file = filename
@@ -444,7 +428,7 @@ class Server:
 
                 # Process this packet
                 full_packet = header_data + encrypted_content
-                file_complete = self.file_manager.file_receiver.handle_file_packet(full_packet, client_id, aes_key)
+                file_complete = self.file_receiver.handle_file_packet(full_packet, client_id, aes_key)
 
                 received_packets += 1
                 logger.debug(f"Received packet {packet_num + 1}/{total_packets} for file: {filename}")
@@ -453,7 +437,7 @@ class Server:
                     if not file_complete:
                         logger.warning(f"File transfer failed for {filename}")
                     else:
-                        crc = self.file_manager.file_receiver.save_complete_file(client_id)
+                        crc = self.file_receiver.save_complete_file(client_id)
                         logger.info(f"File transfer completed for {filename}")
                     break
 
@@ -510,7 +494,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("Server stopping due to keyboard interrupt...")
         server.shutdown()
-
 
 if __name__ == "__main__":
     main()
