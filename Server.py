@@ -20,12 +20,13 @@ DEFAULT_PORT_FILE = "port.info"
 PACKET_SIZE = 1024
 SERVER_MAX_CONNECTIONS = 50
 VERSION = 3
-UNPACK_HEADER_FORMAT = "<BHI"
-PACK_HEADER_FORMAT = "!BHI"
 REQUEST_HEADER_SIZE = 23
 MAX_REQUEST_SIZE = 1073741847  # 1GB payload + 23 bytes for header
 AES_KEY_SIZE = 32
 AES_BLOCK_SIZE = 16
+CLIENT_ID_SIZE = 16
+NAME_SIZE = 255
+KEY_SIZE = 160
 
 # Configure logging
 logging.basicConfig(
@@ -257,8 +258,8 @@ class Server:
             if not header:
                 return None
 
-            client_id = header[:16]
-            version, code, payload_size = struct.unpack(UNPACK_HEADER_FORMAT, header[16:])
+            client_id = header[:CLIENT_ID_SIZE]
+            version, code, payload_size = struct.unpack("<BHI", header[CLIENT_ID_SIZE:])
 
             if payload_size > MAX_REQUEST_SIZE:
                 logger.error(f"Payload size too large: {payload_size}")
@@ -300,11 +301,7 @@ class Server:
 
     def _send_response(self, conn: socket.socket, response: dict):
         try:
-            header = struct.pack(
-                PACK_HEADER_FORMAT,
-                response['version'],
-                response['code'].value,
-                len(response['payload'])
+            header = struct.pack('<BHI', response['version'], response['code'].value, len(response['payload'])
             )
             conn.sendall(header + response['payload'])
         except Exception as e:
@@ -340,8 +337,8 @@ class Server:
 
     def _handle_public_key(self, request: dict, client_addr: str) -> dict:
         try:
-            client_name = request['payload'][:255].decode('ascii').rstrip('\0')
-            public_key = request['payload'][255:415]
+            client_name = request['payload'][:NAME_SIZE].decode('ascii').rstrip('\0')
+            public_key = request['payload'][NAME_SIZE:NAME_SIZE + KEY_SIZE]
 
             encrypted_aes_key, _ = self.security_manager.set_client_keys(client_name, public_key)
             client_info = self.security_manager.get_client_info(client_name)
@@ -360,7 +357,7 @@ class Server:
 
     def _handle_sign_in(self, request: dict, client_addr: str) -> dict:
         try:
-            client_name = request['payload'][:255].decode('ascii').rstrip('\0')
+            client_name = request['payload'][:NAME_SIZE].decode('ascii').rstrip('\0')
             client_info = self.security_manager.get_client_info(client_name)
 
             if client_info and client_info.public_key:
@@ -442,8 +439,8 @@ class Server:
                     break
 
 
-            payload = (client_id + content_size.to_bytes(4,'big') +
-                       bytes(filename.ljust(255,'\0'), 'ascii') + crc.to_bytes(4, 'big'))
+            payload = (client_id + content_size.to_bytes(4,'little') +
+                       bytes(filename.ljust(NAME_SIZE,'\0'), 'ascii') + crc.to_bytes(4, 'little'))
             return {
                 'version': VERSION,
                 'code': ResponseCodes.FILE_RECEIVED,
@@ -476,18 +473,22 @@ class Server:
             'payload': message.encode('ascii')
         }
 
-def main():
+def readPort():
     port = DEFAULT_PORT
     port_file = Path(DEFAULT_PORT_FILE)
-
     if port_file.exists():
         try:
             port = int(port_file.read_text().strip())
             if not (0 <= port <= 65535):
-                port = DEFAULT_PORT
+                return DEFAULT_PORT
         except ValueError:
-            port = DEFAULT_PORT
+            return DEFAULT_PORT
+    else:
+        logger.warning("No port file found, using default port")
+    return port
 
+def main():
+    port = readPort()
     server = Server(port=port)
     try:
         server.start()
