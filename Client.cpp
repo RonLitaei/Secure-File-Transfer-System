@@ -1,4 +1,7 @@
-// File: Client.cpp
+/* File: Client.cpp
+ * The core of the program. In charge of transmitting and receiving data,
+ * analyzes data and provides the response to the server.
+ */
 #include "Client.h"
 #include "SignUp.h"
 #include "FileHandler.h"
@@ -24,20 +27,23 @@ Client::Client()
 std::string Client::readFromMeFile() {
     std::ifstream me_info(ME_FILE);
     if(!me_info.is_open()) {
-        throw std::invalid_argument("me.info not found");
+        throw std::invalid_argument("File 'me.info' not found");
     }
     std::ifstream priv_key_file(PRIV_KEY_FILE);
     if(!priv_key_file.is_open()) {
-        throw std::invalid_argument("priv_key not found");
+        throw std::invalid_argument("File 'priv.key' not found");
     }
     std::string client_name;
-    std::getline(me_info, client_name);//TODO - decide if to add a check to users name
+    std::getline(me_info, client_name);
+    if(!isValidName(client_name)) {
+        throw std::invalid_argument("File 'me.info' corrupted: client name invalid");
+    }
     std::string hex_string;
     std::getline(me_info, hex_string);
     std::string line;
     me_info.close();
 
-    while(std::getline(priv_key_file, line)){//TODO - this needs to be read from priv.key
+    while(std::getline(priv_key_file, line)){
         if(line.empty())
             break;
         private_key += line;
@@ -55,9 +61,19 @@ void Client::initialize() {
     signUp.readTransferFile();
 
     client_name = signUp.getName();
+    if(!isValidName(client_name)) {
+        throw std::invalid_argument("Invalid client name. Please create a new name following the accepted rules");
+    }
     port = signUp.getPort();
+    if(!isValidPort(port)) {
+        throw std::invalid_argument("invalid port. Please provide the correct port");
+    }
     host = signUp.getHost();
+
     file_to_send = signUp.getFilePath();
+    if(isValidFileName(file_to_send)) {
+        throw std::invalid_argument("Invalid filename. Please create a new filename following the accepted rules");
+    }
 
     if(std::filesystem::exists(ME_FILE)) {
         std::string name = readFromMeFile();
@@ -67,45 +83,54 @@ void Client::initialize() {
     }
 }
 
+bool Client::tryRegister() {
+    Response response = SendRequest(RequestCodes::REGISTRATION);
+    handleResponse(response);
+
+    if (response.getCode() == static_cast<uint16_t>(ResponseCodes::REGISTRATION_SUCCESS)) {
+        std::cout << client_name << " Registered successfully." << std::endl;
+        sendPublicKey();
+        return true;
+    }
+    return false;
+}
+
+void Client::sendPublicKey() {
+    Response response = SendRequest(RequestCodes::SENDING_PUBLIC_KEY);
+    handleResponse(response);
+}
+
+bool Client::trySignIn() {
+    Response response = SendRequest(RequestCodes::SIGN_IN);
+    handleResponse(response);
+    return response.getCode() != static_cast<uint16_t>(ResponseCodes::SIGN_IN_FAILED);
+}
+
 void Client::authenticate() {
-    try {
-        // If me.info exists, try to sign in. If declined, the client will try to register with the same name
-        if (!std::filesystem::exists(ME_FILE)) {
-            Request request = requestFromServer(RequestCodes::REGISTRATION);
-            Response response = receive();
-            handleResponse(response);
-            if (response.getCode() == static_cast<uint16_t>(ResponseCodes::REGISTRATION_SUCCESS)) {
-                request = requestFromServer(RequestCodes::SENDING_PUBLIC_KEY);
-                response = receive();
-                handleResponse(response);
-            }
+    if (!std::filesystem::exists(ME_FILE)) {
+        tryRegister();
+    }
+    else {
+        if (!trySignIn()) {
+            std::cout << "Attempting to register: " << client_name << " after a failed sign in" << std::endl;
+            tryRegister();
         }
         else {
-            Request request = requestFromServer(RequestCodes::SIGN_IN);
-            Response response = receive();
-            handleResponse(response);
-            if (response.getCode() == static_cast<uint16_t>(ResponseCodes::SIGN_IN_FAILED)) {
-                request = requestFromServer(RequestCodes::REGISTRATION);
-                response = receive();
-                handleResponse(response);
-            }
+            std::cout << "Client: " << client_name << " signed in sucseesfully" << std::endl;
         }
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Authentication failed: " << e.what() << std::endl;
     }
 }
 
 void Client::sendFile() {
     constexpr size_t MAX_ATTEMPTS = 4;
-    for (size_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+    for (size_t attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         try {
             bool crc_valid = FileHandler::sendEncryptedFile(file_to_send, decrypted_aes_key, client_id, *this);
 
             if (crc_valid) {
                 std::cout << "Client file: '" << file_to_send << "' saved successfully" << std::endl;
                 requestFromServer(RequestCodes::CRC_VALID);
-                receive(); // We don't need to handle this response
+                receive(); // No need to handle response
                 return;
             }
 
@@ -117,7 +142,7 @@ void Client::sendFile() {
 
     std::cout << "Client file: '" << file_to_send << "' corrupted (CRC failed)" << std::endl;
     requestFromServer(RequestCodes::CRC_EXCEEDED_TRIES);
-    receive(); // We don't need to handle this response
+    receive(); // No need to handle response
 }
 
 void Client::connect(const std::string& host, const std::string& port) {
@@ -151,7 +176,7 @@ Response Client::receive() {
 }
 
 void Client::handleResponse(const Response& response) {
-    ResponseCodes code = static_cast<ResponseCodes>(response.getCode());
+    ResponseCodes code = static_cast<ResponseCodes>(response.getCode()); // NOLINT(*-use-auto)
 
     switch (code) {
         case ResponseCodes::REGISTRATION_SUCCESS:
@@ -169,18 +194,19 @@ void Client::handleResponse(const Response& response) {
             handleSignInFailed();
             break;
         case ResponseCodes::FILE_RECEIVED:
-            handleFileReceived(response);
+            throw std::runtime_error("Order of operation is faulty");// Should not reach here, fileHandler takes care of this
             break;
         case ResponseCodes::MESSAGE_RECEIVED:
             // Do nothing
             break;
         case ResponseCodes::GENERAL_ERROR:
-            throw std::runtime_error("Server responded with a General error");
+            throw std::runtime_error("Server responded with an error");
         default:
             throw std::runtime_error("Invalid response code: " + std::to_string(static_cast<int>(code)));
     }
 }
 
+// Requests a single request from a server
 Request Client::requestFromServer(RequestCodes code) {
     if (!connected) {
         connect(host, port);
@@ -192,6 +218,20 @@ Request Client::requestFromServer(RequestCodes code) {
     send(packed_request);
     return request;
 }
+// Sends a request, receives a response and returns it.
+// Follows the protocol, upon receiving general error, attempts to resend upto 4 times.
+Response Client::SendRequest(RequestCodes code) {
+    size_t max_attempts = 4;
+    Response response;
+    for (size_t attempt = 0; attempt < max_attempts; attempt++) {
+        Request request = requestFromServer(code);
+        response = receive();
+        if(response.getCode() != static_cast<uint16_t>(ResponseCodes::GENERAL_ERROR))
+            return response;
+        std::cout << "Attempt " << attempt + 1 << " of " << max_attempts <<  "failed" << std::endl;
+    }
+    return response;
+}
 
 // Private helper methods
 
@@ -202,40 +242,28 @@ void Client::handleRegistrationSuccess(const Response& response) {
 void Client::handlePublicKeyReceived(const Response& response) {
     save_to_me_file(client_id, client_name, private_key);
     save_to_privkey_file(private_key);
-
-    std::string encrypted_aes_key(response.getPayload().begin() + client_id.size(), response.getPayload().end());
-    RSAPrivateWrapper wrapper(private_key);
-    decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
+    decrypted_aes_key = decryptAESKey(response,private_key);
 }
 
 void Client::handleSignInSuccess(const Response& response) {
-    std::string encrypted_aes_key;
-    for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
-        encrypted_aes_key += response.getPayload()[i];
-    }
-    RSAPrivateWrapper wrapper(Base64Wrapper::decode(private_key));
-    decrypted_aes_key = wrapper.decrypt(encrypted_aes_key);
+    decrypted_aes_key = decryptAESKey(response, Base64Wrapper::decode(private_key));
 }
 
 void Client::handleSignInFailed() {
     if (std::remove(ME_FILE) != 0 || std::remove(PRIV_KEY_FILE) != 0) {
         throw std::runtime_error("Failed to remove authentication files");
     }
+    std::cout << "Sign in failed for: " << client_name << std::endl;
 }
 
-void Client::handleFileReceived(const Response& response) {
-    uint32_t crc = FileHandler::crcCalculator(file_to_send);
-    uint32_t crc_from_server = *reinterpret_cast<const uint32_t*>(&response.getPayload()[275]);
-    crc_valid = (crc == crc_from_server);
-}
-
+// Creates custom payload for all type of requests
 std::string Client::createPayload(RequestCodes code) {
     std::string payload;
     switch (code) {
         case RequestCodes::REGISTRATION:
         case RequestCodes::SIGN_IN:
             payload = client_name;
-            payload.resize(255, '\0');
+            payload.resize(NAME_PADDED_SIZE, '\0');
             break;
         case RequestCodes::SENDING_PUBLIC_KEY:
             {
@@ -243,16 +271,16 @@ std::string Client::createPayload(RequestCodes code) {
                 private_key = rsa.getPrivateKey();
                 std::string public_key = rsa.getPublicKey();
                 payload = client_name;
-                payload.resize(255, '\0');
+                payload.resize(NAME_PADDED_SIZE, '\0');
                 payload += public_key;
-                payload.resize(255 + 160, '\0');
+                payload.resize(NAME_PADDED_SIZE + KEY_PADDED_SIZE, '\0');
             }
             break;
         case RequestCodes::CRC_VALID:
         case RequestCodes::CRC_NOT_VALID:
         case RequestCodes::CRC_EXCEEDED_TRIES:
             payload = file_to_send;
-            payload.resize(255, '\0');
+            payload.resize(NAME_PADDED_SIZE, '\0');
             break;
         default:
             throw std::runtime_error("Invalid request code for payload creation");
@@ -292,3 +320,58 @@ void Client::save_to_privkey_file(const std::string& priv_key) {
     priv_key_file << priv_key_base64 << std::endl;
     priv_key_file.close();
 }
+
+// Decrypts aes key with the private key. Only works with 1602 and 1605 type payload
+std::string Client::decryptAESKey(const Response &response, const std::string &privateKey) const {
+    std::string encrypted_aes_key;
+    for(size_t i = client_id.size(); i < response.getPayloadSize(); i++) {
+        encrypted_aes_key += response.getPayload()[i];
+    }
+
+    RSAPrivateWrapper wrapper(privateKey);
+    return wrapper.decrypt(encrypted_aes_key);
+}
+
+bool Client::isValidName(const std::string &name) {
+    if (name.empty() || name.length() > CLIENT_NAME_MAX_SIZE) {
+        return false;
+    }
+    for (char c : name) {
+        if (!std::isalnum(c) && c != ' ' && c != '_' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Client::isValidPort(const std::string &port) {
+    if (port.empty() || port.length() > 5) {
+        return false;
+    }
+    for (char c : port) {
+        if (!std::isdigit(c)) {
+            return false;
+        }
+    }
+    int portNum = std::stoi(port);
+    return (portNum > 0 && portNum <= 65535);
+}
+
+bool Client::isValidFileName(const std::string &fileName) {
+    if (fileName.empty()) {
+        return false;
+    }
+    uint8_t dot_counter = 0;
+    for (char c : fileName) {
+        if (!std::isalnum(c) && c != '_' && c != '-' && c != '.' && c != '/') {
+            return false;
+        }
+        if (c == '.')
+            if (dot_counter)
+                return false;
+        dot_counter++;
+    }
+    return true;
+}
+
+

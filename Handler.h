@@ -6,7 +6,8 @@
 #include <cstdint>
 #include "Message.h"
 
-const uint8_t HEADER_SIZE = 7;
+const uint8_t SERVER_HEADER_SIZE = 7;
+const uint8_t CLIENT_HEADER_SIZE = 23;
 const uint8_t VERSION_POSITION = 0;
 const uint8_t CODE_POSITION = 1;
 const uint8_t PAYLOAD_SIZE_POSITION = 3;

@@ -19,13 +19,6 @@ unsigned char* AESWrapper::GenerateKey(unsigned char* buffer, unsigned int lengt
 
 	return buffer;
 }
-/*
-unsigned char* AESWrapper::GenerateKey(unsigned char* buffer, unsigned int length)
-{
-	for (size_t i = 0; i < length; i += sizeof(unsigned int))
-		_rdrand32_step(reinterpret_cast<unsigned int*>(&buffer[i]));
-	return buffer;
-}*/
 
 AESWrapper::AESWrapper()
 {

@@ -1,9 +1,14 @@
+/*
+ * Handles file reading, encryption, transmitting and crc.
+ */
 #include "FileHandler.h"
 #include <fstream>
 #include <vector>
 #include <stdexcept>
 #include <filesystem>
 #include <algorithm>
+#include <boost/endian/conversion.hpp>
+
 #include "AESWrapper.h"
 #include "Handler.h"
 #include "crc.h"
@@ -57,6 +62,13 @@ void sendInitialRequest(const std::array<uint8_t, 16>& clientId, Client& client)
 
 void sendFilePackets(const std::string& encryptedContent, uint32_t fileSize, const std::string& filename,
     Client& client) {
+    struct HeaderSizesData {// Sizes of each field
+        uint8_t encrypted_data_size = 4;
+        uint8_t file_size = 4;
+        uint8_t packet_num_size = 2;
+        uint8_t total_packets_size = 2;
+    }sizes;
+
     uint32_t encryptedSize = static_cast<uint32_t>(encryptedContent.size());
     uint16_t totalPackets = static_cast<uint16_t>((encryptedSize + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
 
@@ -67,41 +79,48 @@ void sendFilePackets(const std::string& encryptedContent, uint32_t fileSize, con
         std::string payload;
         payload.reserve(HEADER_SIZE + chunkSize);
 
-        payload.append(reinterpret_cast<const char*>(&encryptedSize), 4);
-        payload.append(reinterpret_cast<const char*>(&fileSize), 4);
-        payload.append(reinterpret_cast<const char*>(&packetNum), 2);
-        payload.append(reinterpret_cast<const char*>(&totalPackets), 2);
+        // Append as little endian
+        uint32_t le_encryptedSize = boost::endian::native_to_little(encryptedSize);
+        uint32_t le_fileSize = boost::endian::native_to_little(fileSize);
+        uint16_t le_packetNum = boost::endian::native_to_little(packetNum);
+        uint16_t le_totalPackets = boost::endian::native_to_little(totalPackets);
+
+        payload.append(reinterpret_cast<const char*>(&le_encryptedSize), sizes.encrypted_data_size);
+        payload.append(reinterpret_cast<const char*>(&le_fileSize), sizes.file_size);
+        payload.append(reinterpret_cast<const char*>(&le_packetNum), sizes.packet_num_size);
+        payload.append(reinterpret_cast<const char*>(&le_totalPackets), sizes.total_packets_size);
         payload += filename;
         payload += encryptedContent.substr(offset, chunkSize);
 
         client.send(payload);
     }
 }
-
+/*
+ * Encrypts the file, sends the first header and then sends each packet with its own meta-data.
+ * Note: this method encrypts the entire file, this is done in order to be compatible with
+ * the protocol, a better approach will be to encrypt each chunk, send it and redo.
+ */
 bool sendEncryptedFile(const std::string& filePath, const std::string& aesKey, const std::array<uint8_t, 16>& clientId, Client& client) {
     std::vector<char> fileContent = readFileContent(filePath);
     std::string encryptedContent = encryptContent(fileContent, aesKey);
 
     std::string filename = std::filesystem::path(filePath).filename().string();
-    filename.resize(255, '\0');
+    filename.resize(Client::NAME_PADDED_SIZE, '\0');
 
     sendInitialRequest(clientId, client);
     sendFilePackets(encryptedContent, static_cast<uint32_t>(fileContent.size()), filename, client);
 
-    // Wait for server response
     Response response = client.receive();
     if (response.getCode() != static_cast<uint16_t>(ResponseCodes::FILE_RECEIVED)) {
-        throw std::runtime_error("Unexpected server response after file send");
+        throw std::runtime_error("Unexpected server response after file sending");
     }
 
     // Validate CRC
+    uint16_t CRC_POS = 275;// CRC position in the payload
     std::string data = response.getPayload();
     uint32_t crc = crcCalculator(filePath);
-    //uint32_t crc_from_server = *reinterpret_cast<const uint32_t*>(&response.getPayload()[275]);
-    uint32_t crc_from_server = (data[275] << 24)
-               | (data[275+1] << 16)
-               | (data[275+2] << 8)
-               | data[275+3];
+    uint32_t crc_from_server = *reinterpret_cast<const uint32_t*>(&data[CRC_POS]);
+    crc_from_server = boost::endian::little_to_native(crc_from_server);
     return (crc == crc_from_server);
 }
 

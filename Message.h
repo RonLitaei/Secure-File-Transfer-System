@@ -45,8 +45,7 @@ public:
     void setPayloadSize(uint32_t payload_size);
     void setPayload(const std::string& payload);
 
-    virtual std::vector<uint8_t> serialize() const = 0;
-    virtual void deserialize(const std::vector<uint8_t>& data) = 0;
+    virtual ~Message() = default;
 
 protected:
     uint8_t version;
@@ -63,9 +62,7 @@ public:
 
     const std::array<uint8_t, 16>& getClientID() const;
     void setClientID(const std::array<uint8_t, 16>& client_id);
-
-    std::vector<uint8_t> serialize() const override;
-    void deserialize(const std::vector<uint8_t>& data) override;
+    virtual ~Request() = default;
 
 private:
     std::array<uint8_t, 16> client_id;
@@ -76,8 +73,7 @@ public:
     Response();
     Response(uint8_t version, uint16_t code, uint32_t payload_size, const std::string& payload);
 
-    std::vector<uint8_t> serialize() const override;
-    void deserialize(const std::vector<uint8_t>& data) override;
+    virtual ~Response() = default;
 };
 
 #define MESSAGE_H

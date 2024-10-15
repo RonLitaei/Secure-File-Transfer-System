@@ -5,7 +5,7 @@
 #ifndef SIGNUP_H
 #pragma once
 #include <string>
-
+const std::string TRANSFER_FILE = "transfer.info";
 class SignUp {
 public:
     SignUp();
@@ -16,10 +16,10 @@ public:
     std::string getFilePath() const;
 
 private:
-    std::string m_name;
-    std::string m_port;
-    std::string m_host;
-    std::string m_filePath;
+    std::string _name;
+    std::string _port;
+    std::string _host;
+    std::string _filePath;
 };
 #define SIGNUP_H
 
