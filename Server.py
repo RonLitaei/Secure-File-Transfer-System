@@ -8,27 +8,9 @@ from typing import Dict, Optional, Tuple
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Random import get_random_bytes
-from enum import Enum
-import logging
-from pathlib import Path
 import crc
+from utils import *
 
-# Constants
-HOST = ''
-DEFAULT_PORT = 1256
-DEFAULT_PORT_FILE = "port.info"
-PACKET_SIZE = 1024
-SERVER_MAX_CONNECTIONS = 50
-VERSION = 3
-REQUEST_HEADER_SIZE = 23
-MAX_REQUEST_SIZE = 1073741847  # 1GB payload + 23 bytes for header
-AES_KEY_SIZE = 32
-AES_BLOCK_SIZE = 16
-CLIENT_ID_SIZE = 16
-NAME_SIZE = 255
-KEY_SIZE = 160
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -39,34 +21,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-class RequestCodes(Enum):
-    REGISTRATION = 825
-    SENDING_PUBLIC_KEY = 826
-    SIGN_IN = 827
-    SENDING_FILE = 828
-    CRC_VALID = 900
-    CRC_NOT_VALID = 901
-    CRC_EXCEEDED_TRIES = 902
-
-class ResponseCodes(Enum):
-    REGISTRATION_SUCCESS = 1600
-    REGISTRATION_FAILED = 1601
-    PUBLIC_KEY_RECEIVED_SENDING_AES = 1602
-    FILE_RECEIVED = 1603
-    MESSAGE_RECEIVED = 1604
-    SIGN_IN_SUCCESS = 1605
-    SIGN_IN_FAILED = 1606
-    GENERAL_ERROR = 1607
-
-
 @dataclass
 class ClientInfo:
     client_id: bytes
     aes_key: Optional[bytes] = None
     public_key: Optional[bytes] = None
 
-
+'''
+ Register clients, holds their info and creates RSA and AES keys for each client
+'''
 class SecurityManager:
     def __init__(self):
         self.clients: Dict[str, ClientInfo] = {}
@@ -105,6 +68,10 @@ class SecurityManager:
 
         return encrypted_aes_key, aes_key
 
+'''
+ Creates a directory called received_files and stores clients file by hexed id.
+ The requested client file will be stored in that directory.
+'''
 class FileReceiver:
     HEADER_SIZE = 267
 
@@ -123,13 +90,14 @@ class FileReceiver:
     def parse_header(self, header_data: bytes) -> tuple:
         if len(header_data) != self.HEADER_SIZE:
             raise ValueError(f"Invalid header size: {len(header_data)}")
-
+        # Based on the protocol
         encrypted_size, original_size = struct.unpack('<II', header_data[:8])
         packet_num, total_packets = struct.unpack('<HH', header_data[8:12])
         filename = header_data[12:267].rstrip(b'\x00').decode('ascii')
 
         return encrypted_size, original_size, packet_num, total_packets, filename
 
+    # Stores each encrypted packet in clients dictionary
     def handle_file_packet(self, packet_data: bytes, client_id: bytes, aes_key: bytes) -> bool:
         try:
             header = packet_data[:self.HEADER_SIZE]
@@ -161,6 +129,7 @@ class FileReceiver:
             logger.error(f"Error processing packet for client {client_id.hex()}: {e}")
             return False
 
+    # Saves the entire file based on the encrypted packets
     def save_complete_file(self, client_id: bytes) -> crc.UNSIGNED:
         if client_id not in self.current_file_infos:
             logger.warning(f"No file info found for client {client_id.hex()}")
@@ -196,7 +165,9 @@ class FileReceiver:
             logger.error(f"Error saving complete file for client {client_id.hex()}: {e}")
             del self.current_file_infos[client_id]
             return 0
-
+'''
+ Server can be started, handle multiple clients, receive and process requests for each client.
+'''
 class Server:
     def __init__(self, host: str = HOST, port: int = DEFAULT_PORT):
         self.host = host
@@ -233,6 +204,7 @@ class Server:
         self.sock.close()
         logger.info("Server shutdown complete")
 
+    # Client thread
     def _handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
         client_addr = f"{addr[0]}:{addr[1]}"
         logger.info(f"New connection from {client_addr}")
@@ -252,6 +224,7 @@ class Server:
             conn.close()
             logger.info(f"Connection closed for {client_addr}")
 
+    # Receive requests based on the protocol, header first then the payload
     def _receive_request(self, conn: socket.socket) -> Optional[dict]:
         try:
             header = self._receive_exact(conn, REQUEST_HEADER_SIZE)
@@ -307,6 +280,7 @@ class Server:
         except Exception as e:
             logger.error(f"Error sending response: {e}")
 
+    # Receives data in packets
     @staticmethod
     def _receive_exact(conn: socket.socket, size: int) -> Optional[bytes]:
         data = bytearray()
@@ -322,12 +296,14 @@ class Server:
         client_id = self.security_manager.register_client(client_name)
 
         if client_id:
+            logger.info(f"Client {client_name} successfully registered")
             return {
                 'version': VERSION,
                 'code': ResponseCodes.REGISTRATION_SUCCESS,
                 'payload': client_id
             }
         else:
+            logger.warning(f"Client {client_name} failed to register")
             return {
                 'version': VERSION,
                 'code': ResponseCodes.REGISTRATION_FAILED,
@@ -366,6 +342,7 @@ class Server:
 
                 payload = client_info.client_id + encrypted_aes_key
 
+                logger.info(f"Client {client_name} successfully signed in")
                 return {
                     'version': VERSION,
                     'code': ResponseCodes.SIGN_IN_SUCCESS,
@@ -408,7 +385,6 @@ class Server:
                 if not header_data:
                     break
 
-                # Parse header
                 content_size, orig_file_size, packet_num, total_packets, filename \
                     = self.file_receiver.parse_header(header_data)
 
@@ -451,6 +427,7 @@ class Server:
             logger.error(f"Error handling file: {e}")
             return self._create_error_response("Failed to process file")
 
+    # Just a regular message to let the client know that his message was accepted
     def _handle_crc(self, request: dict, client_addr: str) -> dict:
         client_id = request.get('client_id')
         if self.security_manager.get_client_name(client_id) is None:
@@ -472,29 +449,3 @@ class Server:
             'code': ResponseCodes.GENERAL_ERROR,
             'payload': message.encode('ascii')
         }
-
-def readPort():
-    port = DEFAULT_PORT
-    port_file = Path(DEFAULT_PORT_FILE)
-    if port_file.exists():
-        try:
-            port = int(port_file.read_text().strip())
-            if not (0 <= port <= 65535):
-                return DEFAULT_PORT
-        except ValueError:
-            return DEFAULT_PORT
-    else:
-        logger.warning("No port file found, using default port")
-    return port
-
-def main():
-    port = readPort()
-    server = Server(port=port)
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        logger.info("Server stopping due to keyboard interrupt...")
-        server.shutdown()
-
-if __name__ == "__main__":
-    main()
