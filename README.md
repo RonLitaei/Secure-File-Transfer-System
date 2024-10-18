@@ -9,10 +9,11 @@ This system consists of two main components:
 
 The system enables secure file transfer between clients and the server using encryption (AES-CBC for symmetric encryption and RSA for asymmetric encryption).
 The server stores each client's files in their own unique directory named after the client's uid.
-Server with a detailed logger:
+
+### Server with a detailed logger:
 ![server](https://github.com/user-attachments/assets/798f333e-0025-4796-a24e-8acdae20d81b)
 
-The client side:
+### The client side:
 ![client](https://github.com/user-attachments/assets/541a6935-8ce2-404b-bbda-7276ad80fc4e)
 
 
