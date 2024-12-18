@@ -1,4 +1,3 @@
-# mmn15
 # Secure File Transfer System
 A secure client-server application for encrypted file transfer using TCP/IP protocol.
 
